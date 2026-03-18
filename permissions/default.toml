@@ -1,0 +1,15 @@
+[default]
+description = "Default permissions for the plugin"
+permissions = [
+   "allow-load",
+   "allow-play",
+   "allow-pause",
+   "allow-stop",
+   "allow-seek",
+   "allow-set-volume",
+   "allow-set-muted",
+   "allow-set-playback-rate",
+   "allow-set-loop",
+   "allow-get-state",
+   "allow-is-native",
+]

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-set-playback-rate"
+description = "Enables the set_playback_rate command without any pre-configured scope."
+commands.allow = ["set_playback_rate"]
+
+[[permission]]
+identifier = "deny-set-playback-rate"
+description = "Denies the set_playback_rate command without any pre-configured scope."
+commands.deny = ["set_playback_rate"]
