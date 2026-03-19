@@ -1,0 +1,25 @@
+{
+   "productName": "tauri-app",
+   "version": "0.1.0",
+   "identifier": "com.silvermine.tauri-plugin-audio-demo",
+   "build": {
+      "beforeDevCommand": "npm run vite",
+      "beforeBuildCommand": "npm run build",
+      "devUrl": "http://localhost:1420",
+      "frontendDist": "../dist"
+   },
+   "app": {
+      "windows": [
+         {
+            "title": "Audio Player Demo",
+            "width": 700,
+            "height": 360,
+            "resizable": true,
+            "fullscreen": false
+         }
+      ],
+      "security": {
+         "csp": null
+      }
+   }
+}
