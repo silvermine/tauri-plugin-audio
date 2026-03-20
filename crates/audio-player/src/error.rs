@@ -10,8 +10,11 @@ pub enum Error {
    #[error("Invalid Value: {0}")]
    InvalidValue(String),
 
-   #[error("Not Loaded")]
-   NotLoaded,
+   #[error("Audio: {0}")]
+   Audio(String),
+
+   #[error("HTTP: {0}")]
+   Http(String),
 
    #[error(transparent)]
    Io(#[from] std::io::Error),

@@ -11,9 +11,8 @@ pub enum PlaybackStatus {
    #[default]
    Idle,
 
-   /// An audio source is being loaded. Reserved for the real implementation
-   /// where loading is asynchronous. The mock transitions directly from
-   /// Idle to Ready.
+   /// An audio source is being fetched or decoded. The player enters this
+   /// state before starting I/O and transitions to `Ready` on success.
    Loading,
 
    /// Audio source is loaded and ready to play.
