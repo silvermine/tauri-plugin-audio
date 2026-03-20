@@ -1,0 +1,75 @@
+*,
+*::before,
+*::after {
+   box-sizing: border-box;
+   margin: 0;
+   padding: 0;
+}
+
+body {
+   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+      sans-serif;
+   font-size: 14px;
+   line-height: 1.5;
+   color: #f5f5f7;
+   background-color: #1c1c1e;
+   -webkit-font-smoothing: antialiased;
+   -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+   font-family: inherit;
+   background: none;
+   border: none;
+   color: #f5f5f7;
+   cursor: pointer;
+   padding: 0;
+}
+
+button:disabled {
+   opacity: 0.3;
+   cursor: not-allowed;
+}
+
+input[type="text"] {
+   font-family: inherit;
+   font-size: 13px;
+   background: #2c2c2e;
+   border: 1px solid #48484a;
+   border-radius: 6px;
+   color: #f5f5f7;
+   padding: 8px 12px;
+   outline: none;
+}
+
+input[type="text"]:focus {
+   border-color: #0a84ff;
+}
+
+/* Range input (progress bar and volume slider) */
+input[type="range"] {
+   -webkit-appearance: none;
+   appearance: none;
+   background: transparent;
+   cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+   height: 4px;
+   border-radius: 2px;
+   background: #48484a;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+   -webkit-appearance: none;
+   appearance: none;
+   width: 12px;
+   height: 12px;
+   border-radius: 50%;
+   background: #f5f5f7;
+   margin-top: -4px;
+}
+
+input[type="range"]:disabled::-webkit-slider-thumb {
+   opacity: 0;
+}

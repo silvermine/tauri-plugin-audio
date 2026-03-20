@@ -1,0 +1,19 @@
+{
+   "compilerOptions": {
+      "target": "ES2021",
+      "useDefineForClassFields": true,
+      "lib": ["ES2021", "DOM"],
+      "module": "ESNext",
+      "skipLibCheck": true,
+      "esModuleInterop": true,
+      "allowSyntheticDefaultImports": true,
+      "strict": true,
+      "noUnusedLocals": true,
+      "noUnusedParameters": true,
+      "noFallthroughCasesInSwitch": true,
+      "moduleResolution": "bundler",
+      "jsx": "preserve"
+   },
+   "include": ["src/**/*.ts", "src/**/*.vue"],
+   "references": [{ "path": "./tsconfig.node.json" }]
+}
