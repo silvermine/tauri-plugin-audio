@@ -13,6 +13,12 @@ pub enum Error {
    #[error("Not Loaded")]
    NotLoaded,
 
+   #[error("Audio: {0}")]
+   Audio(String),
+
+   #[error("HTTP: {0}")]
+   Http(String),
+
    #[error(transparent)]
    Io(#[from] std::io::Error),
 }

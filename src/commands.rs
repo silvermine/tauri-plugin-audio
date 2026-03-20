@@ -1,8 +1,9 @@
 use tauri::{AppHandle, Runtime, command};
 
+use audio_player::Result;
+use audio_player::models::{AudioActionResponse, AudioMetadata, PlayerState};
+
 use crate::AudioExt;
-use crate::error::Result;
-use crate::models::{AudioActionResponse, AudioMetadata, PlayerState};
 
 #[command]
 pub(crate) async fn load<R: Runtime>(

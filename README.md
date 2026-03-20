@@ -19,14 +19,40 @@ designed to be wrapped by a consuming app's own API layer.
    * OS transport control integration via metadata (title, artist, artwork)
    * Real-time state change events (status, time, volume, etc.)
    * Volume, mute, playback rate, and loop controls
-   * Cross-platform support (Windows, iOS, Android)
+   * Cross-platform support
 
 | Platform | Supported |
 | -------- | --------- |
-| Windows  | Planned   |
-| macOS    | Planned   |
-| Android  | Planned   |
-| iOS      | Planned   |
+| macOS    | Yes |
+| Windows  | Yes |
+| Linux    | Yes |
+| iOS      | Yes (native planned) |
+| Android  | Yes (native planned) |
+
+Playback is provided by the
+[Rodio](https://github.com/RustAudio/rodio) audio library via the
+standalone `audio-player` crate, which works across all platforms. Full
+native support for iOS and Android is planned.
+
+### Platform Notes
+
+#### Android
+
+Android playback uses Rodio's
+[Oboe](https://github.com/google/oboe) backend via cpal. The
+`audio-player` crate includes a build script that links `libc++_shared`
+on Android targets — Tauri's build system automatically bundles the
+shared library from the NDK into the APK.
+
+No additional Gradle or manifest configuration is required beyond
+Tauri's standard Android setup.
+
+#### iOS
+
+iOS playback uses Rodio's
+[CoreAudio](https://developer.apple.com/documentation/coreaudio)
+backend via cpal. No additional configuration is required beyond
+Tauri's standard iOS setup.
 
 ## Getting Started
 
