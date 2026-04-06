@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -47,6 +48,7 @@ struct Inner {
 /// rebuilds the next chunk when the current one is exhausted.
 const WSOLA_MAX_CHUNK_SECS: f64 = 30.0;
 const WSOLA_MAX_WALL_CHUNK_SECS: f64 = 8.0;
+const INTERACTIVE_WSOLA_MAX_WALL_CHUNK_SECS: f64 = 2.5;
 
 /// Pre-decoded interleaved PCM audio data.
 struct PcmData {
@@ -79,6 +81,22 @@ struct PlaybackContext {
    current_chunk_media_secs: f64,
    queued_chunk_media_secs: VecDeque<f64>,
    last_sink_pos_secs: f64,
+   pending_chunk_build: Option<PendingChunkBuild>,
+   build_generation: u64,
+}
+
+struct PendingChunkBuild {
+   generation: u64,
+   start_offset: f64,
+   rate: f64,
+   rx: Receiver<BuiltChunkData>,
+}
+
+struct BuiltChunkData {
+   interleaved: Vec<f32>,
+   sample_rate: u32,
+   channel_count: u16,
+   chunk_media_secs: f64,
 }
 
 impl PlaybackContext {
@@ -217,7 +235,7 @@ impl RodioAudioPlayer {
       // Read the current rate before building the source (avoid holding lock
       // during potentially expensive WSOLA processing).
       let rate = lock_inner(&self.inner).state.playback_rate;
-      let (source, chunk_media_secs) = build_source(&pcm, 0.0, rate);
+      let (source, chunk_media_secs) = build_initial_source(&pcm, 0.0, rate);
 
       // Create a new sink, append the built source, and pause immediately
       // so playback waits for an explicit play() call.
@@ -247,6 +265,8 @@ impl RodioAudioPlayer {
          current_chunk_media_secs: chunk_media_secs.min(duration),
          queued_chunk_media_secs: VecDeque::new(),
          last_sink_pos_secs: 0.0,
+         pending_chunk_build: None,
+         build_generation: 0,
       });
 
       Ok(inner.state.clone())
@@ -509,77 +529,68 @@ fn monitor_loop(
          break;
       }
 
-      let mut guard = lock_inner(&inner);
+      let mut ended_snapshot = None;
+      let mut time_update = None;
 
-      let (media_time, duration, is_empty) = match &mut guard.playback {
-         Some(ctx) => {
+      {
+         let mut guard = lock_inner(&inner);
+         if guard.playback.is_none() {
+            break;
+         }
+
+         let looping = guard.state.looping;
+         let volume = effective_volume(&guard.state);
+
+         let (media_time, duration, is_empty) = {
+            let ctx = guard.playback.as_mut().expect("playback checked above");
+            try_apply_pending_chunk_build(ctx);
+
             let media_time = ctx.clamped_media_time();
             let duration = ctx.duration;
             let is_empty = ctx.sink.empty();
-            (media_time, duration, is_empty)
-         }
-         None => break,
-      };
 
-      if is_empty {
-         if guard.state.looping {
-            // Rebuild source from the beginning for loop.
-            let volume = effective_volume(&guard.state);
-            if let Some(ctx) = &mut guard.playback {
-               let rate = ctx.active_rate;
-               if rebuild_playback(ctx, &stream_handle, 0.0, rate, volume).is_ok() {
-                  ctx.sink.play();
+            if is_empty {
+               if looping {
+                  let rate = ctx.active_rate;
+                  if rebuild_playback(ctx, &stream_handle, 0.0, rate, volume).is_ok() {
+                     ctx.sink.play();
+                  }
                }
+            } else {
+               maybe_start_pending_chunk_build(ctx, media_time);
             }
-            guard.state.current_time = 0.0;
-            drop(guard);
-            on_time_update(&TimeUpdate {
-               current_time: 0.0,
-               duration,
-            });
-         } else {
-            guard.state.status = PlaybackStatus::Ended;
-            guard.state.current_time = duration;
-            let snapshot = guard.state.clone();
-            drop(guard);
-            on_changed(&snapshot);
-            break;
-         }
-      } else {
-         // Pre-queue the next WSOLA chunk before the current one drains,
-         // so Rodio cross-fades seamlessly with no audible gap.
-         let needs_prequeue = match &guard.playback {
-            Some(ctx) => {
-               let buffer_ahead = ctx.queued_through - media_time;
-               let target_buffer = prequeue_target_buffer_secs(
-                  ctx.current_chunk_media_secs,
-                  ctx.active_rate,
-               );
-               buffer_ahead < target_buffer
-                  && ctx.queued_through < duration - 0.01
-                  && (ctx.active_rate - 1.0).abs() >= 1e-9
-            }
-            None => false,
+
+            (media_time, duration, is_empty)
          };
 
-         if needs_prequeue {
-            if let Some(ctx) = &mut guard.playback {
-               let pcm = Arc::clone(&ctx.pcm);
-               let next_offset = ctx.queued_through;
-               let rate = ctx.active_rate;
-               let (source, chunk_media_secs) = build_source(&pcm, next_offset, rate);
-               ctx.sink.append(source);
-               ctx.queued_chunk_media_secs.push_back(chunk_media_secs);
-               ctx.queued_through = (next_offset + chunk_media_secs).min(ctx.duration);
+         if is_empty {
+            if looping {
+               guard.state.current_time = 0.0;
+               time_update = Some(TimeUpdate {
+                  current_time: 0.0,
+                  duration,
+               });
+            } else {
+               guard.state.status = PlaybackStatus::Ended;
+               guard.state.current_time = duration;
+               ended_snapshot = Some(guard.state.clone());
             }
+         } else {
+            guard.state.current_time = media_time;
+            time_update = Some(TimeUpdate {
+               current_time: media_time,
+               duration,
+            });
          }
+      }
 
-         guard.state.current_time = media_time;
-         drop(guard);
-         on_time_update(&TimeUpdate {
-            current_time: media_time,
-            duration,
-         });
+      if let Some(snapshot) = ended_snapshot {
+         on_changed(&snapshot);
+         break;
+      }
+
+      if let Some(update) = time_update {
+         on_time_update(&update);
       }
    }
 }
@@ -606,17 +617,27 @@ fn update_chunk_tracking(
    duration: f64,
 ) {
    if sink_pos_secs + SINK_POS_RESET_EPSILON_SECS < *last_sink_pos_secs {
-      *seek_offset = (*seek_offset + *current_chunk_media_secs).min(duration);
-      *current_chunk_media_secs = queued_chunk_media_secs
-         .pop_front()
-         .unwrap_or_else(|| (duration - *seek_offset).max(0.0));
+     *seek_offset = (*seek_offset + *current_chunk_media_secs).min(duration);
+     *current_chunk_media_secs = queued_chunk_media_secs
+        .pop_front()
+        .unwrap_or_else(|| (duration - *seek_offset).max(0.0));
+
    }
 
    *last_sink_pos_secs = sink_pos_secs;
- }
+}
 
+#[cfg(test)]
 fn max_wsola_chunk_media_secs(rate: f64) -> f64 {
    (WSOLA_MAX_WALL_CHUNK_SECS * rate).min(WSOLA_MAX_CHUNK_SECS)
+}
+
+fn max_wsola_chunk_media_secs_for_wall_limit(rate: f64, wall_limit_secs: f64) -> f64 {
+   (wall_limit_secs * rate).min(WSOLA_MAX_CHUNK_SECS)
+}
+
+fn interactive_wsola_chunk_media_secs(rate: f64) -> f64 {
+   max_wsola_chunk_media_secs_for_wall_limit(rate, INTERACTIVE_WSOLA_MAX_WALL_CHUNK_SECS)
 }
 
 fn prequeue_target_buffer_secs(current_chunk_media_secs: f64, active_rate: f64) -> f64 {
@@ -624,6 +645,72 @@ fn prequeue_target_buffer_secs(current_chunk_media_secs: f64, active_rate: f64) 
       PRE_QUEUE_SECS
    } else {
       current_chunk_media_secs.max(PRE_QUEUE_SECS)
+   }
+}
+
+fn maybe_start_pending_chunk_build(ctx: &mut PlaybackContext, media_time: f64) {
+   if (ctx.active_rate - 1.0).abs() < 1e-9
+      || ctx.pending_chunk_build.is_some()
+      || ctx.queued_through >= ctx.duration - 0.01
+   {
+      return;
+   }
+
+   let buffer_ahead = ctx.queued_through - media_time;
+   let target_buffer = prequeue_target_buffer_secs(ctx.current_chunk_media_secs, ctx.active_rate);
+   if buffer_ahead >= target_buffer {
+      return;
+   }
+
+   let pcm = Arc::clone(&ctx.pcm);
+   let start_offset = ctx.queued_through;
+   let rate = ctx.active_rate;
+   let generation = ctx.build_generation;
+   let (tx, rx) = mpsc::sync_channel(1);
+
+   match std::thread::Builder::new()
+      .name("audio-prebuild".into())
+      .spawn(move || {
+         let chunk = build_chunk_data(&pcm, start_offset, rate, WSOLA_MAX_WALL_CHUNK_SECS);
+         let _ = tx.send(chunk);
+      })
+   {
+      Ok(_) => {
+         ctx.pending_chunk_build = Some(PendingChunkBuild {
+            generation,
+            start_offset,
+            rate,
+            rx,
+         });
+      }
+      Err(e) => warn!("Failed to spawn audio prebuild thread: {e}"),
+   }
+}
+
+fn try_apply_pending_chunk_build(ctx: &mut PlaybackContext) {
+   let Some(pending) = ctx.pending_chunk_build.take() else {
+      return;
+   };
+
+   match pending.rx.try_recv() {
+      Ok(chunk) => {
+         if pending.generation == ctx.build_generation
+            && (pending.start_offset - ctx.queued_through).abs() < 0.01
+            && (pending.rate - ctx.active_rate).abs() < 1e-9
+         {
+            ctx.sink.append(SamplesBuffer::new(
+               chunk.channel_count,
+               chunk.sample_rate,
+               chunk.interleaved,
+            ));
+            ctx.queued_chunk_media_secs.push_back(chunk.chunk_media_secs);
+            ctx.queued_through = (pending.start_offset + chunk.chunk_media_secs).min(ctx.duration);
+         }
+      }
+      Err(TryRecvError::Empty) => {
+         ctx.pending_chunk_build = Some(pending);
+      }
+      Err(TryRecvError::Disconnected) => {}
    }
 }
 
@@ -673,7 +760,12 @@ fn decode_to_pcm(data: &[u8]) -> Result<(PcmData, f64)> {
 /// Returns `(source, chunk_media_secs)` where `chunk_media_secs` is the
 /// number of media-time seconds this chunk covers (used for pre-queue
 /// bookkeeping).
-fn build_source(pcm: &PcmData, seek_offset_secs: f64, rate: f64) -> (SamplesBuffer<f32>, f64) {
+fn build_chunk_data(
+   pcm: &PcmData,
+   seek_offset_secs: f64,
+   rate: f64,
+   wall_limit_secs: f64,
+) -> BuiltChunkData {
    let num_ch = pcm.channel_count as usize;
    let total_frames = if num_ch > 0 { pcm.interleaved.len() / num_ch } else { 0 };
    let frame_offset =
@@ -681,28 +773,25 @@ fn build_source(pcm: &PcmData, seek_offset_secs: f64, rate: f64) -> (SamplesBuff
    let sample_offset = frame_offset * num_ch;
 
    if (rate - 1.0).abs() < 1e-9 {
-      // Passthrough: direct slice, no WSOLA, no deinterleave.
       let remaining_frames = total_frames - frame_offset;
       let chunk_media_secs = remaining_frames as f64 / pcm.sample_rate as f64;
-      (
-         SamplesBuffer::new(
-            pcm.channel_count,
-            pcm.sample_rate,
-            pcm.interleaved[sample_offset..].to_vec(),
-         ),
+      BuiltChunkData {
+         interleaved: pcm.interleaved[sample_offset..].to_vec(),
+         sample_rate: pcm.sample_rate,
+         channel_count: pcm.channel_count,
          chunk_media_secs,
-      )
+      }
    } else {
-      // Cap the input so WSOLA stays responsive on long files.
       let max_chunk_frames =
-         ((max_wsola_chunk_media_secs(rate) * pcm.sample_rate as f64) as usize).max(1);
+         ((max_wsola_chunk_media_secs_for_wall_limit(rate, wall_limit_secs) * pcm.sample_rate as f64)
+            as usize)
+            .max(1);
       let remaining_frames = total_frames - frame_offset;
       let chunk_frames = remaining_frames.min(max_chunk_frames);
       let chunk_media_secs = chunk_frames as f64 / pcm.sample_rate as f64;
       let chunk_end = sample_offset + chunk_frames * num_ch;
       let chunk = &pcm.interleaved[sample_offset..chunk_end];
 
-      // Deinterleave only the chunk into per-channel buffers for WSOLA.
       let mut channels = vec![Vec::with_capacity(chunk_frames); num_ch.max(1)];
       for (i, &sample) in chunk.iter().enumerate() {
          channels[i % num_ch.max(1)].push(sample);
@@ -711,7 +800,6 @@ fn build_source(pcm: &PcmData, seek_offset_secs: f64, rate: f64) -> (SamplesBuff
       let alpha = 1.0 / rate;
       let processed = wsola::wsola(&channels, alpha, &WsolaParams::default());
 
-      // Re-interleave the WSOLA output.
       let out_frames = processed.iter().map(|ch| ch.len()).max().unwrap_or(0);
       let mut interleaved = Vec::with_capacity(out_frames * num_ch);
       for i in 0..out_frames {
@@ -720,11 +808,49 @@ fn build_source(pcm: &PcmData, seek_offset_secs: f64, rate: f64) -> (SamplesBuff
          }
       }
 
-      (
-         SamplesBuffer::new(pcm.channel_count, pcm.sample_rate, interleaved),
+      BuiltChunkData {
+         interleaved,
+         sample_rate: pcm.sample_rate,
+         channel_count: pcm.channel_count,
          chunk_media_secs,
-      )
+      }
    }
+}
+
+fn build_source_with_wall_limit(
+   pcm: &PcmData,
+   seek_offset_secs: f64,
+   rate: f64,
+   wall_limit_secs: f64,
+) -> (SamplesBuffer<f32>, f64) {
+   let chunk = build_chunk_data(pcm, seek_offset_secs, rate, wall_limit_secs);
+   (
+      SamplesBuffer::new(chunk.channel_count, chunk.sample_rate, chunk.interleaved),
+      chunk.chunk_media_secs,
+   )
+}
+
+#[cfg(test)]
+fn build_source(pcm: &PcmData, seek_offset_secs: f64, rate: f64) -> (SamplesBuffer<f32>, f64) {
+   build_source_with_wall_limit(
+      pcm,
+      seek_offset_secs,
+      rate,
+      max_wsola_chunk_media_secs(rate) / rate,
+   )
+}
+
+fn build_initial_source(
+   pcm: &PcmData,
+   seek_offset_secs: f64,
+   rate: f64,
+) -> (SamplesBuffer<f32>, f64) {
+   build_source_with_wall_limit(
+      pcm,
+      seek_offset_secs,
+      rate,
+      interactive_wsola_chunk_media_secs(rate) / rate,
+   )
 }
 
 /// Rebuild playback: stop the old sink, create a new one, build a source,
@@ -741,12 +867,14 @@ fn rebuild_playback(
 ) -> Result<()> {
    // Stop old sink so Sink::drop returns immediately.
    ctx.sink.stop();
+   ctx.build_generation = ctx.build_generation.wrapping_add(1);
+   ctx.pending_chunk_build = None;
 
    let new_sink = Sink::try_new(stream_handle)
       .map_err(|e| Error::Audio(format!("Failed to create audio sink: {e}")))?;
    new_sink.pause();
 
-   let (source, chunk_media_secs) = build_source(&ctx.pcm, seek_offset, rate);
+   let (source, chunk_media_secs) = build_initial_source(&ctx.pcm, seek_offset, rate);
    new_sink.append(source);
    new_sink.set_volume(volume);
 
@@ -1228,6 +1356,13 @@ mod tests {
    }
 
    #[test]
+   fn interactive_wsola_chunk_media_secs_scales_with_rate() {
+      assert!((interactive_wsola_chunk_media_secs(0.75) - 1.875).abs() < 1e-9);
+      assert!((interactive_wsola_chunk_media_secs(2.0) - 5.0).abs() < 1e-9);
+      assert!((interactive_wsola_chunk_media_secs(4.0) - 10.0).abs() < 1e-9);
+   }
+
+   #[test]
    fn prequeue_target_buffer_secs_tracks_chunk_size_for_rate_adjusted_playback() {
       assert!((prequeue_target_buffer_secs(10.0, 1.0) - PRE_QUEUE_SECS).abs() < 1e-9);
       assert!((prequeue_target_buffer_secs(6.0, 0.75) - 6.0).abs() < 1e-9);
@@ -1274,6 +1409,22 @@ mod tests {
       assert!((slow_chunk_secs - 6.0).abs() < 0.02);
       assert!((fast_chunk_secs - 16.0).abs() < 0.02);
       assert!((maxed_chunk_secs - 30.0).abs() < 0.02);
+   }
+
+   #[test]
+   fn initial_chunk_media_secs_wsola_respects_interactive_wall_duration_cap() {
+      let sr = 100;
+      let total_secs = 65.0;
+      let total_frames = (total_secs * sr as f64) as usize;
+      let pcm = synth_pcm(total_frames, 1, sr);
+
+      let (_, slow_chunk_secs) = build_initial_source(&pcm, 0.0, 0.75);
+      let (_, fast_chunk_secs) = build_initial_source(&pcm, 0.0, 2.0);
+      let (_, maxed_chunk_secs) = build_initial_source(&pcm, 0.0, 4.0);
+
+      assert!((slow_chunk_secs - 1.875).abs() < 0.02);
+      assert!((fast_chunk_secs - 5.0).abs() < 0.02);
+      assert!((maxed_chunk_secs - 10.0).abs() < 0.02);
    }
 
    /// Consecutive chunks cover the full file with no gap or overlap.
