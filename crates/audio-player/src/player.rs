@@ -99,6 +99,13 @@ struct BuiltChunkData {
    chunk_media_secs: f64,
 }
 
+struct PreparedPlaybackRebuild {
+   sink: Sink,
+   seek_offset: f64,
+   rate: f64,
+   chunk_media_secs: f64,
+}
+
 impl PlaybackContext {
    fn sync_chunk_progress(&mut self) {
       let sink_pos_secs = self.sink.get_pos().as_secs_f64();
@@ -352,30 +359,50 @@ impl RodioAudioPlayer {
    }
 
    pub fn seek(&self, position: f64) -> Result<AudioActionResponse> {
-      let snapshot = {
+      let mut pending_rebuild = None;
+
+      let (seek_pos, status, volume) = {
          let mut inner = lock_inner(&self.inner);
 
          transitions::seek(&mut inner.state, position)?;
 
-         // Rebuild from the new position. The source-builder slices the PCM
-         // buffer directly — no format-dependent try_seek needed.
          let seek_pos = inner.state.current_time;
          let status = inner.state.status;
          let volume = effective_volume(&inner.state);
+         if let Some(ctx) = &inner.playback {
+            pending_rebuild = Some((
+               Arc::clone(&ctx.pcm),
+               ctx.active_rate,
+               ctx.build_generation,
+            ));
+         }
+
+         (seek_pos, status, volume)
+      };
+
+      let prepared_rebuild = pending_rebuild
+         .map(|(pcm, rate, expected_generation)| {
+            prepare_playback_rebuild(&self.stream_handle, &pcm, seek_pos, rate, volume)
+               .map(|prepared| (pcm, expected_generation, prepared))
+         });
+
+      let snapshot = {
+         let mut inner = lock_inner(&self.inner);
+         inner.state.current_time = seek_pos;
+
          if let Some(ctx) = &mut inner.playback {
-            let rate = ctx.active_rate;
-            if let Err(e) = rebuild_playback(
-               ctx,
-               &self.stream_handle,
-               seek_pos,
-               rate,
-               volume,
-            ) {
-               warn!("Seek rebuild failed: {e}");
-            }
-            // Preserve play/pause state.
-            if status == PlaybackStatus::Playing {
-               ctx.sink.play();
+            if let Some(result) = prepared_rebuild {
+               match result {
+                  Ok((pcm, expected_generation, prepared)) => {
+                     if Arc::ptr_eq(&ctx.pcm, &pcm) && ctx.build_generation == expected_generation {
+                        apply_prepared_playback_rebuild(ctx, prepared);
+                        if status == PlaybackStatus::Playing {
+                           ctx.sink.play();
+                        }
+                     }
+                  }
+                  Err(e) => warn!("Seek rebuild failed: {e}"),
+               }
             }
          }
 
@@ -853,6 +880,45 @@ fn build_initial_source(
    )
 }
 
+fn prepare_playback_rebuild(
+   stream_handle: &OutputStreamHandle,
+   pcm: &PcmData,
+   seek_offset: f64,
+   rate: f64,
+   volume: f32,
+) -> Result<PreparedPlaybackRebuild> {
+   let new_sink = Sink::try_new(stream_handle)
+      .map_err(|e| Error::Audio(format!("Failed to create audio sink: {e}")))?;
+   new_sink.pause();
+
+   let (source, chunk_media_secs) = build_initial_source(pcm, seek_offset, rate);
+   new_sink.append(source);
+   new_sink.set_volume(volume);
+
+   Ok(PreparedPlaybackRebuild {
+      sink: new_sink,
+      seek_offset,
+      rate,
+      chunk_media_secs,
+   })
+}
+
+fn apply_prepared_playback_rebuild(
+   ctx: &mut PlaybackContext,
+   prepared: PreparedPlaybackRebuild,
+) {
+   ctx.sink.stop();
+   ctx.build_generation = ctx.build_generation.wrapping_add(1);
+   ctx.pending_chunk_build = None;
+   ctx.sink = prepared.sink;
+   ctx.seek_offset = prepared.seek_offset;
+   ctx.active_rate = prepared.rate;
+   ctx.queued_through = (prepared.seek_offset + prepared.chunk_media_secs).min(ctx.duration);
+   ctx.current_chunk_media_secs = prepared.chunk_media_secs;
+   ctx.queued_chunk_media_secs.clear();
+   ctx.last_sink_pos_secs = 0.0;
+}
+
 /// Rebuild playback: stop the old sink, create a new one, build a source,
 /// and update the context. The new sink starts paused.
 ///
@@ -865,26 +931,8 @@ fn rebuild_playback(
    rate: f64,
    volume: f32,
 ) -> Result<()> {
-   // Stop old sink so Sink::drop returns immediately.
-   ctx.sink.stop();
-   ctx.build_generation = ctx.build_generation.wrapping_add(1);
-   ctx.pending_chunk_build = None;
-
-   let new_sink = Sink::try_new(stream_handle)
-      .map_err(|e| Error::Audio(format!("Failed to create audio sink: {e}")))?;
-   new_sink.pause();
-
-   let (source, chunk_media_secs) = build_initial_source(&ctx.pcm, seek_offset, rate);
-   new_sink.append(source);
-   new_sink.set_volume(volume);
-
-   ctx.sink = new_sink;
-   ctx.seek_offset = seek_offset;
-   ctx.active_rate = rate;
-   ctx.queued_through = (seek_offset + chunk_media_secs).min(ctx.duration);
-   ctx.current_chunk_media_secs = chunk_media_secs;
-   ctx.queued_chunk_media_secs.clear();
-   ctx.last_sink_pos_secs = 0.0;
+   let prepared = prepare_playback_rebuild(stream_handle, &ctx.pcm, seek_offset, rate, volume)?;
+   apply_prepared_playback_rebuild(ctx, prepared);
 
    Ok(())
 }
