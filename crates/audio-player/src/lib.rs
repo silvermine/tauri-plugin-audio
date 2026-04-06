@@ -2,6 +2,7 @@ pub mod error;
 pub mod models;
 mod net;
 mod player;
+mod wsola;
 pub mod transitions;
 
 pub use error::{Error, Result};

@@ -14,3 +14,26 @@ tauri-plugin-audio = { path = "../../../" }
 
 [build-dependencies]
 tauri-build = { version = "2.0.6", features = [] }
+
+# Optimize audio decoding and WSOLA in dev builds so `tauri dev` is usable.
+# Without this, the eager PCM decode and time-stretch run ~20-50× slower.
+[profile.dev.package.audio-player]
+opt-level = 3
+
+[profile.dev.package.rodio]
+opt-level = 3
+
+[profile.dev.package.symphonia]
+opt-level = 3
+
+[profile.dev.package.symphonia-bundle-mp3]
+opt-level = 3
+
+[profile.dev.package.symphonia-core]
+opt-level = 3
+
+[profile.dev.package.symphonia-format-isomp4]
+opt-level = 3
+
+[profile.dev.package.symphonia-codec-aac]
+opt-level = 3
