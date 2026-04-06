@@ -203,7 +203,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue';
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
 import './style.css';
 import {
    getPlayer,
@@ -247,6 +247,7 @@ let unlistenTime: (() => void) | null = null;
 let seekInFlight = false;
 let queuedSeekPosition: number | null = null;
 let seekEpoch = 0;
+let lastDragSeekPosition: number | null = null;
 
 const MAX_LOG_ENTRIES = 200;
 
@@ -431,6 +432,7 @@ function clampSeekPosition(position: number): number {
 function invalidateSeekInteraction(): void {
    seekEpoch += 1;
    queuedSeekPosition = null;
+   lastDragSeekPosition = null;
    seekPreviewTime.value = null;
    isSeekDragging.value = false;
 }
@@ -482,13 +484,25 @@ function queueSeek(position: number): void {
 
 function beginSeekDrag(): void {
    isSeekDragging.value = true;
+   lastDragSeekPosition = null;
    seekPreviewTime.value = currentTime.value;
 }
 
 function endSeekDrag(position: number): void {
-   isSeekDragging.value = false;
    const clamped = clampSeekPosition(position);
+   const alreadyQueuedDuringDrag = lastDragSeekPosition !== null && Math.abs(lastDragSeekPosition - clamped) < 1e-9;
+
+   isSeekDragging.value = false;
    currentTime.value = clamped;
+   lastDragSeekPosition = null;
+
+   if (alreadyQueuedDuringDrag) {
+      if (!seekInFlight && queuedSeekPosition === null) {
+         seekPreviewTime.value = null;
+      }
+      return;
+   }
+
    queueSeek(clamped);
 }
 
@@ -573,6 +587,7 @@ function seekTo(position: number): void {
    if (!isSeekDragging.value) {
       isSeekDragging.value = true;
    }
+   lastDragSeekPosition = clamped;
    queueSeek(clamped);
 }
 
