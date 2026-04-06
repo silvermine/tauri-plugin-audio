@@ -353,21 +353,21 @@ impl RodioAudioPlayer {
    }
 
    pub fn seek(&self, position: f64) -> Result<AudioActionResponse> {
-      let mut pending_rebuild = None;
+     let mut pending_rebuild = None;
 
-      let (seek_pos, status, volume) = {
+      let (seek_pos, volume) = {
          let mut inner = lock_inner(&self.inner);
 
          transitions::seek(&mut inner.state, position)?;
 
          let seek_pos = inner.state.current_time;
-         let status = inner.state.status;
          let volume = effective_volume(&inner.state);
-         if let Some(ctx) = &inner.playback {
+         if let Some(ctx) = &mut inner.playback {
+            ctx.build_generation = ctx.build_generation.wrapping_add(1);
             pending_rebuild = Some((Arc::clone(&ctx.pcm), ctx.active_rate, ctx.build_generation));
          }
 
-         (seek_pos, status, volume)
+         (seek_pos, volume)
       };
 
       let prepared_rebuild = pending_rebuild.map(|(pcm, rate, expected_generation)| {
@@ -377,7 +377,8 @@ impl RodioAudioPlayer {
 
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
-         inner.state.current_time = seek_pos;
+         let should_play = inner.state.status == PlaybackStatus::Playing;
+         let mut applied_seek = false;
 
          if let Some(ctx) = &mut inner.playback
             && let Some(result) = prepared_rebuild
@@ -386,13 +387,18 @@ impl RodioAudioPlayer {
                   Ok((pcm, expected_generation, prepared)) => {
                      if Arc::ptr_eq(&ctx.pcm, &pcm) && ctx.build_generation == expected_generation {
                         apply_prepared_playback_rebuild(ctx, prepared);
-                        if status == PlaybackStatus::Playing {
+                        if should_play {
                            ctx.sink.play();
                         }
+                        applied_seek = true;
                      }
                   }
                   Err(e) => warn!("Seek rebuild failed: {e}"),
                }
+         }
+
+         if applied_seek {
+            inner.state.current_time = seek_pos;
          }
 
          inner.state.clone()
@@ -557,7 +563,7 @@ fn monitor_loop(
          let looping = guard.state.looping;
          let volume = effective_volume(&guard.state);
 
-         let (media_time, duration, is_empty) = {
+         let (media_time, duration, is_empty, has_pending_chunk_build, queued_through) = {
             let ctx = guard.playback.as_mut().expect("playback checked above");
             try_apply_pending_chunk_build(ctx);
 
@@ -571,12 +577,23 @@ fn monitor_loop(
                   if rebuild_playback(ctx, &stream_handle, 0.0, rate, volume).is_ok() {
                      ctx.sink.play();
                   }
+               } else {
+                  maybe_start_pending_chunk_build(ctx, media_time);
                }
             } else {
                maybe_start_pending_chunk_build(ctx, media_time);
             }
 
-            (media_time, duration, is_empty)
+            let has_pending_chunk_build = ctx.pending_chunk_build.is_some();
+            let queued_through = ctx.queued_through;
+
+            (
+               media_time,
+               duration,
+               is_empty,
+               has_pending_chunk_build,
+               queued_through,
+            )
          };
 
          if is_empty {
@@ -586,10 +603,16 @@ fn monitor_loop(
                   current_time: 0.0,
                   duration,
                });
-            } else {
+            } else if should_mark_ended_when_empty(queued_through, duration, has_pending_chunk_build) {
                guard.state.status = PlaybackStatus::Ended;
                guard.state.current_time = duration;
                ended_snapshot = Some(guard.state.clone());
+            } else {
+               guard.state.current_time = media_time;
+               time_update = Some(TimeUpdate {
+                  current_time: media_time,
+                  duration,
+               });
             }
          } else {
             guard.state.current_time = media_time;
@@ -661,6 +684,10 @@ fn prequeue_target_buffer_secs(current_chunk_media_secs: f64, active_rate: f64) 
    } else {
       current_chunk_media_secs.max(PRE_QUEUE_SECS)
    }
+}
+
+fn should_mark_ended_when_empty(queued_through: f64, duration: f64, has_pending_chunk_build: bool) -> bool {
+   !has_pending_chunk_build && queued_through >= duration - 0.01
 }
 
 fn maybe_start_pending_chunk_build(ctx: &mut PlaybackContext, media_time: f64) {
@@ -1411,6 +1438,19 @@ mod tests {
       assert!((prequeue_target_buffer_secs(6.0, 0.75) - 6.0).abs() < 1e-9);
       assert!((prequeue_target_buffer_secs(16.0, 2.0) - 16.0).abs() < 1e-9);
       assert!((prequeue_target_buffer_secs(2.0, 0.5) - PRE_QUEUE_SECS).abs() < 1e-9);
+   }
+
+   #[test]
+   fn should_mark_ended_when_empty_only_after_all_media_is_queued() {
+      assert!(should_mark_ended_when_empty(10.0, 10.0, false));
+      assert!(should_mark_ended_when_empty(9.995, 10.0, false));
+      assert!(!should_mark_ended_when_empty(9.0, 10.0, false));
+   }
+
+   #[test]
+   fn should_mark_ended_when_empty_waits_for_pending_chunk_builds() {
+      assert!(!should_mark_ended_when_empty(9.0, 10.0, true));
+      assert!(!should_mark_ended_when_empty(10.0, 10.0, true));
    }
 
    // -----------------------------------------------------------------------
