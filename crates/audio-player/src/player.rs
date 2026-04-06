@@ -17,6 +17,7 @@ use crate::{OnChanged, OnTimeUpdate, transitions};
 
 /// Maximum audio download size (100 MiB).
 const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_DECODED_PCM_BYTES: usize = 768 * 1024 * 1024;
 
 /// HTTP request timeout (connect + read combined).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -239,18 +240,6 @@ impl RodioAudioPlayer {
 
       let pcm = Arc::new(pcm);
 
-      // Read the current rate before building the source (avoid holding lock
-      // during potentially expensive WSOLA processing).
-      let rate = lock_inner(&self.inner).state.playback_rate;
-      let (source, chunk_media_secs) = build_initial_source(&pcm, 0.0, rate);
-
-      // Create a new sink, append the built source, and pause immediately
-      // so playback waits for an explicit play() call.
-      let sink = Sink::try_new(&self.stream_handle)
-         .map_err(|e| Error::Audio(format!("Failed to create audio sink: {e}")))?;
-      sink.pause();
-      sink.append(source);
-
       // Commit the state transition under the lock.
       let mut inner = lock_inner(&self.inner);
 
@@ -258,6 +247,13 @@ impl RodioAudioPlayer {
       transitions::load(&mut inner.state, src, meta, duration)?;
 
       Self::stop_monitor(&inner);
+
+      let rate = inner.state.playback_rate;
+      let (source, chunk_media_secs) = build_initial_source(&pcm, 0.0, rate);
+      let sink = Sink::try_new(&self.stream_handle)
+         .map_err(|e| Error::Audio(format!("Failed to create audio sink: {e}")))?;
+      sink.pause();
+      sink.append(source);
 
       // Apply current user settings to the new sink.
       sink.set_volume(effective_volume(&inner.state));
@@ -758,6 +754,10 @@ fn try_apply_pending_chunk_build(ctx: &mut PlaybackContext) {
 
 /// Decode compressed audio bytes into interleaved PCM and duration.
 fn decode_to_pcm(data: &[u8]) -> Result<(PcmData, f64)> {
+   decode_to_pcm_with_limit(data, MAX_DECODED_PCM_BYTES)
+}
+
+fn decode_to_pcm_with_limit(data: &[u8], max_decoded_bytes: usize) -> Result<(PcmData, f64)> {
    let source = Decoder::new(Cursor::new(data.to_vec()))
       .map_err(|e| Error::Audio(format!("Failed to decode audio: {e}")))?;
 
@@ -765,8 +765,22 @@ fn decode_to_pcm(data: &[u8]) -> Result<(PcmData, f64)> {
    let channel_count = source.channels();
    let reported_duration = source.total_duration();
 
-   // Collect all interleaved samples, converting i16 → f32.
-   let interleaved: Vec<f32> = source.map(|s| s as f32 / i16::MAX as f32).collect();
+   let max_samples = max_decoded_bytes / std::mem::size_of::<f32>();
+   if max_samples == 0 {
+      return Err(Error::Audio(format!(
+         "Decoded audio exceeds maximum PCM size of {max_decoded_bytes} bytes"
+      )));
+   }
+
+   let mut interleaved = Vec::new();
+   for sample in source {
+      if interleaved.len() >= max_samples {
+         return Err(Error::Audio(format!(
+            "Decoded audio exceeds maximum PCM size of {max_decoded_bytes} bytes"
+         )));
+      }
+      interleaved.push(sample as f32 / i16::MAX as f32);
+   }
 
    let num_ch = channel_count as usize;
    let total_frames = if num_ch > 0 {
@@ -1131,6 +1145,19 @@ mod tests {
       assert_eq!(pcm.channel_count, 2);
       // Interleaved: 4410 frames * 2 channels = 8820 samples
       assert_eq!(pcm.interleaved.len(), 8820);
+   }
+
+   #[test]
+   fn decode_to_pcm_rejects_oversized_decoded_audio() {
+      let samples: Vec<i16> = (0..5).collect();
+      let wav = make_wav(&samples, 44100);
+
+      match decode_to_pcm_with_limit(&wav, 16) {
+         Err(Error::Audio(msg)) => {
+            assert!(msg.contains("maximum PCM size of 16 bytes"));
+         }
+         _ => panic!("expected oversized decoded audio error"),
+      }
    }
 
    // -----------------------------------------------------------------------
