@@ -230,10 +230,10 @@ impl RodioAudioPlayer {
       let (pcm, mut duration) = decode_to_pcm(&raw_data)?;
 
       // Fallback: if the decoder couldn't determine duration, try symphonia probe.
-      if duration <= 0.0 {
-         if let Some(d) = probe_duration(&raw_data) {
-            duration = d;
-         }
+      if duration <= 0.0
+         && let Some(d) = probe_duration(&raw_data)
+      {
+         duration = d;
       }
       drop(raw_data); // Free compressed bytes — PCM replaces them.
 
@@ -287,17 +287,11 @@ impl RodioAudioPlayer {
          // Rebuild source for replay from Ended.
          if is_ended {
             let volume = effective_volume(&inner.state);
-            if let Some(ctx) = &mut inner.playback {
-               if ctx.sink.empty() {
-                  let rate = ctx.active_rate;
-                  let _ = rebuild_playback(
-                     ctx,
-                     &self.stream_handle,
-                     0.0,
-                     rate,
-                     volume,
-                  );
-               }
+            if let Some(ctx) = &mut inner.playback
+               && ctx.sink.empty()
+            {
+               let rate = ctx.active_rate;
+               let _ = rebuild_playback(ctx, &self.stream_handle, 0.0, rate, volume);
             }
          }
 
@@ -370,28 +364,24 @@ impl RodioAudioPlayer {
          let status = inner.state.status;
          let volume = effective_volume(&inner.state);
          if let Some(ctx) = &inner.playback {
-            pending_rebuild = Some((
-               Arc::clone(&ctx.pcm),
-               ctx.active_rate,
-               ctx.build_generation,
-            ));
+            pending_rebuild = Some((Arc::clone(&ctx.pcm), ctx.active_rate, ctx.build_generation));
          }
 
          (seek_pos, status, volume)
       };
 
-      let prepared_rebuild = pending_rebuild
-         .map(|(pcm, rate, expected_generation)| {
-            prepare_playback_rebuild(&self.stream_handle, &pcm, seek_pos, rate, volume)
-               .map(|prepared| (pcm, expected_generation, prepared))
-         });
+      let prepared_rebuild = pending_rebuild.map(|(pcm, rate, expected_generation)| {
+         prepare_playback_rebuild(&self.stream_handle, &pcm, seek_pos, rate, volume)
+            .map(|prepared| (pcm, expected_generation, prepared))
+      });
 
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
          inner.state.current_time = seek_pos;
 
-         if let Some(ctx) = &mut inner.playback {
-            if let Some(result) = prepared_rebuild {
+         if let Some(ctx) = &mut inner.playback
+            && let Some(result) = prepared_rebuild
+         {
                match result {
                   Ok((pcm, expected_generation, prepared)) => {
                      if Arc::ptr_eq(&ctx.pcm, &pcm) && ctx.build_generation == expected_generation {
@@ -403,7 +393,6 @@ impl RodioAudioPlayer {
                   }
                   Err(e) => warn!("Seek rebuild failed: {e}"),
                }
-            }
          }
 
          inner.state.clone()
@@ -644,11 +633,10 @@ fn update_chunk_tracking(
    duration: f64,
 ) {
    if sink_pos_secs + SINK_POS_RESET_EPSILON_SECS < *last_sink_pos_secs {
-     *seek_offset = (*seek_offset + *current_chunk_media_secs).min(duration);
-     *current_chunk_media_secs = queued_chunk_media_secs
-        .pop_front()
-        .unwrap_or_else(|| (duration - *seek_offset).max(0.0));
-
+      *seek_offset = (*seek_offset + *current_chunk_media_secs).min(duration);
+      *current_chunk_media_secs = queued_chunk_media_secs
+         .pop_front()
+         .unwrap_or_else(|| (duration - *seek_offset).max(0.0));
    }
 
    *last_sink_pos_secs = sink_pos_secs;
@@ -700,8 +688,7 @@ fn maybe_start_pending_chunk_build(ctx: &mut PlaybackContext, media_time: f64) {
       .spawn(move || {
          let chunk = build_chunk_data(&pcm, start_offset, rate, WSOLA_MAX_WALL_CHUNK_SECS);
          let _ = tx.send(chunk);
-      })
-   {
+      }) {
       Ok(_) => {
          ctx.pending_chunk_build = Some(PendingChunkBuild {
             generation,
@@ -730,7 +717,8 @@ fn try_apply_pending_chunk_build(ctx: &mut PlaybackContext) {
                chunk.sample_rate,
                chunk.interleaved,
             ));
-            ctx.queued_chunk_media_secs.push_back(chunk.chunk_media_secs);
+            ctx.queued_chunk_media_secs
+               .push_back(chunk.chunk_media_secs);
             ctx.queued_through = (pending.start_offset + chunk.chunk_media_secs).min(ctx.duration);
          }
       }
@@ -751,12 +739,14 @@ fn decode_to_pcm(data: &[u8]) -> Result<(PcmData, f64)> {
    let reported_duration = source.total_duration();
 
    // Collect all interleaved samples, converting i16 → f32.
-   let interleaved: Vec<f32> = source
-      .map(|s| s as f32 / i16::MAX as f32)
-      .collect();
+   let interleaved: Vec<f32> = source.map(|s| s as f32 / i16::MAX as f32).collect();
 
    let num_ch = channel_count as usize;
-   let total_frames = if num_ch > 0 { interleaved.len() / num_ch } else { 0 };
+   let total_frames = if num_ch > 0 {
+      interleaved.len() / num_ch
+   } else {
+      0
+   };
 
    let duration = reported_duration
       .map(|d| d.as_secs_f64())
@@ -794,9 +784,12 @@ fn build_chunk_data(
    wall_limit_secs: f64,
 ) -> BuiltChunkData {
    let num_ch = pcm.channel_count as usize;
-   let total_frames = if num_ch > 0 { pcm.interleaved.len() / num_ch } else { 0 };
-   let frame_offset =
-      ((seek_offset_secs * pcm.sample_rate as f64) as usize).min(total_frames);
+   let total_frames = if num_ch > 0 {
+      pcm.interleaved.len() / num_ch
+   } else {
+      0
+   };
+   let frame_offset = ((seek_offset_secs * pcm.sample_rate as f64) as usize).min(total_frames);
    let sample_offset = frame_offset * num_ch;
 
    if (rate - 1.0).abs() < 1e-9 {
@@ -809,10 +802,9 @@ fn build_chunk_data(
          chunk_media_secs,
       }
    } else {
-      let max_chunk_frames =
-         ((max_wsola_chunk_media_secs_for_wall_limit(rate, wall_limit_secs) * pcm.sample_rate as f64)
-            as usize)
-            .max(1);
+      let max_chunk_frames = ((max_wsola_chunk_media_secs_for_wall_limit(rate, wall_limit_secs)
+         * pcm.sample_rate as f64) as usize)
+         .max(1);
       let remaining_frames = total_frames - frame_offset;
       let chunk_frames = remaining_frames.min(max_chunk_frames);
       let chunk_media_secs = chunk_frames as f64 / pcm.sample_rate as f64;
@@ -903,10 +895,7 @@ fn prepare_playback_rebuild(
    })
 }
 
-fn apply_prepared_playback_rebuild(
-   ctx: &mut PlaybackContext,
-   prepared: PreparedPlaybackRebuild,
-) {
+fn apply_prepared_playback_rebuild(ctx: &mut PlaybackContext, prepared: PreparedPlaybackRebuild) {
    ctx.sink.stop();
    ctx.build_generation = ctx.build_generation.wrapping_add(1);
    ctx.pending_chunk_build = None;
@@ -1307,7 +1296,10 @@ mod tests {
       let iter1 = build_source(&pcm, 0.0, 0.75).0.count();
       let iter2 = build_source(&pcm, 0.0, 0.75).0.count();
 
-      assert_eq!(iter1, iter2, "consecutive loop iterations should produce identical length");
+      assert_eq!(
+         iter1, iter2,
+         "consecutive loop iterations should produce identical length"
+      );
    }
 
    /// Monitor-loop time math: verify that output duration × rate ≈ media duration.
@@ -1392,7 +1384,10 @@ mod tests {
       );
 
       let after = seek_offset + last_sink_pos_secs * rate;
-      assert!(after > before, "media time should keep moving forward across chunk boundaries");
+      assert!(
+         after > before,
+         "media time should keep moving forward across chunk boundaries"
+      );
       assert!((after - 30.2).abs() < 1e-9);
    }
 
@@ -1492,7 +1487,10 @@ mod tests {
 
       while offset < total_secs - 0.01 {
          let (_, chunk_secs) = build_source(&pcm, offset, rate);
-         assert!(chunk_secs > 0.0, "chunk at offset {offset} produced 0 media seconds");
+         assert!(
+            chunk_secs > 0.0,
+            "chunk at offset {offset} produced 0 media seconds"
+         );
          covered += chunk_secs;
          offset += chunk_secs;
          chunks += 1;
@@ -1548,7 +1546,14 @@ mod tests {
       let (src_a, secs_a) = build_source(&pcm, 0.0, 1.5);
       let (src_b, secs_b) = build_source(&pcm, 0.0, 1.5);
 
-      assert_eq!(src_a.count(), src_b.count(), "loop restart should produce identical first chunk");
-      assert!((secs_a - secs_b).abs() < 1e-9, "chunk coverage should be identical on restart");
+      assert_eq!(
+         src_a.count(),
+         src_b.count(),
+         "loop restart should produce identical first chunk"
+      );
+      assert!(
+         (secs_a - secs_b).abs() < 1e-9,
+         "chunk coverage should be identical on restart"
+      );
    }
 }

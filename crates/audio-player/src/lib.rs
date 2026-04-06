@@ -2,8 +2,8 @@ pub mod error;
 pub mod models;
 mod net;
 mod player;
-mod wsola;
 pub mod transitions;
+mod wsola;
 
 pub use error::{Error, Result};
 pub use models::{AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerState, TimeUpdate};
