@@ -124,7 +124,7 @@ impl RodioAudioPlayer {
       lock_inner(&self.inner).state.clone()
    }
 
-   pub fn load(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
+   pub fn prepare(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
       let meta = metadata.unwrap_or_default();
 
       // Transition to Loading and notify the frontend before starting I/O.
@@ -138,7 +138,7 @@ impl RodioAudioPlayer {
 
       // Perform I/O, decoding, and sink creation. If any step fails,
       // transition to Error so the frontend can recover from the Loading state.
-      let result = self.load_inner(src, &meta);
+      let result = self.prepare_inner(src, &meta);
 
       match result {
          Ok(snapshot) => {
@@ -156,9 +156,9 @@ impl RodioAudioPlayer {
       }
    }
 
-   /// Inner load logic that may fail. Separated so `load()` can catch errors
+   /// Inner prepare logic that may fail. Separated so `prepare()` can catch errors
    /// and transition to the Error state before propagating.
-   fn load_inner(&self, src: &str, meta: &AudioMetadata) -> Result<PlayerState> {
+   fn prepare_inner(&self, src: &str, meta: &AudioMetadata) -> Result<PlayerState> {
       let descriptor = load_source_descriptor(src)?;
       let source = open_source(&descriptor)?;
       let duration = source
@@ -176,7 +176,7 @@ impl RodioAudioPlayer {
       let mut inner = lock_inner(&self.inner);
 
       // Re-check after I/O — another thread may have changed the state.
-      transitions::load(&mut inner.state, src, meta, duration)?;
+      transitions::prepare(&mut inner.state, src, meta, duration)?;
 
       Self::stop_monitor(&inner);
 

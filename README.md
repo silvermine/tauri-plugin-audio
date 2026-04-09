@@ -148,7 +148,7 @@ async function checkPlayer() {
 }
 ```
 
-#### Load, play, pause, stop, or seek
+#### Prepare, play, pause, stop, or seek
 
 The API uses discriminated unions with type guards for compile-time safety.
 Only valid transport actions are available based on the player's status.
@@ -158,11 +158,11 @@ import {
    getPlayer, PlaybackStatus, hasAction, AudioAction,
 } from '@silvermine/tauri-plugin-audio';
 
-async function loadAndPlay() {
+async function prepareAndPlay() {
    const player = await getPlayer();
 
    if (player.status === PlaybackStatus.Idle) {
-      const { player: ready } = await player.load(
+      const { player: ready } = await player.prepare(
          'https://example.com/song.mp3',
          {
             title: 'My Song',
@@ -260,13 +260,13 @@ the current `PlaybackStatus`:
 
 | Status    | Allowed Actions              |
 | --------- | ---------------------------- |
-| Idle      | load                         |
+| Idle      | prepare                      |
 | Loading   | stop                         |
 | Ready     | play, seek, stop             |
 | Playing   | pause, seek, stop            |
 | Paused    | play, seek, stop             |
-| Ended     | play, seek, load, stop       |
-| Error     | load                         |
+| Ended     | play, seek, prepare, stop    |
+| Error     | prepare                      |
 
 Settings (`setVolume`, `setMuted`, `setPlaybackRate`, `setLoop`),
 `listen`, and `onTimeUpdate` are always available regardless of

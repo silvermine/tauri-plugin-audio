@@ -6,12 +6,12 @@ use audio_player::models::{AudioActionResponse, AudioMetadata, PlayerState};
 use crate::AudioExt;
 
 #[command]
-pub(crate) async fn load<R: Runtime>(
+pub(crate) async fn prepare<R: Runtime>(
    app: AppHandle<R>,
    src: String,
    metadata: Option<AudioMetadata>,
 ) -> Result<AudioActionResponse> {
-   app.audio().load(&src, metadata)
+   app.audio().prepare(&src, metadata)
 }
 
 #[command]

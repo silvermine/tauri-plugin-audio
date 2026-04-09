@@ -20,7 +20,7 @@ export { attachPlayer };
  * const player = await getPlayer();
  *
  * if (player.status === PlaybackStatus.Idle) {
- *    const { player: ready } = await player.load('https://example.com/song.mp3', {
+ *    const { player: ready } = await player.prepare('https://example.com/song.mp3', {
  *       title: 'My Song',
  *       artist: 'Artist Name',
  *    });
