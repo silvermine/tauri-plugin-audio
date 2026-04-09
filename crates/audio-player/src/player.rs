@@ -1,9 +1,12 @@
-use std::io::{Cursor, Read};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
+use rodio::{Decoder, Player, Sample, Source};
 use tracing::warn;
 
 use crate::error::{Error, Result};
@@ -11,22 +14,17 @@ use crate::models::{AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerSt
 use crate::net::reject_private_host;
 use crate::{OnChanged, OnTimeUpdate, transitions};
 
-/// Maximum audio download size (100 MiB).
-const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
-
 /// HTTP request timeout (connect + read combined).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Audio player backed by Rodio for cross-platform desktop playback.
 ///
-/// Manages a dedicated audio output thread, a playback monitor for time updates
+/// Manages audio output, a playback monitor for time updates
 /// and end-of-track detection, and a state machine matching the plugin's
 /// [`PlaybackStatus`] model.
 pub struct RodioAudioPlayer {
    inner: Arc<Mutex<Inner>>,
-   stream_handle: OutputStreamHandle,
-   /// Dropping this sender signals the audio output thread to exit.
-   _stream_keep_alive: std::sync::mpsc::Sender<()>,
+   output_sink: MixerDeviceSink,
    on_changed: OnChanged,
    on_time_update: OnTimeUpdate,
 }
@@ -38,21 +36,47 @@ struct Inner {
 }
 
 struct PlaybackContext {
-   sink: Sink,
-   /// Raw audio bytes kept for looping re-append and replay from Ended.
-   /// Wrapped in `Arc` so re-append clones are cheap reference count bumps
-   /// instead of multi-megabyte copies.
-   source_data: Arc<[u8]>,
+   sink: Player,
+   source: SourceDescriptor,
    duration: f64,
 }
+
+#[derive(Clone)]
+enum SourceDescriptor {
+   Local { path: PathBuf },
+   Remote(RemoteSourceDescriptor),
+}
+
+#[derive(Clone)]
+struct RemoteSourceDescriptor {
+   url: String,
+   byte_len: Option<u64>,
+   mime_type: Option<String>,
+   hint: Option<String>,
+}
+
+struct HttpAudioReader {
+   url: String,
+   position: u64,
+   byte_len: Option<u64>,
+   reader: Option<HttpResponseReader>,
+   reached_eof: bool,
+}
+
+struct HttpResponseReader {
+   inner: Mutex<Box<dyn Read + Send>>,
+}
+
+type BoxedSource = Box<dyn Source<Item = Sample> + Send>;
 
 impl RodioAudioPlayer {
    /// Creates a new Rodio-backed audio player.
    ///
-   /// Opens the default audio output device on a dedicated thread. Returns an error
+   /// Opens the default audio output device. Returns an error
    /// if no audio device is available.
    pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Self> {
-      let stream_handle = open_audio_output()?;
+      let mut output_sink = open_audio_output()?;
+      output_sink.log_on_drop(false);
 
       Ok(Self {
          inner: Arc::new(Mutex::new(Inner {
@@ -60,8 +84,7 @@ impl RodioAudioPlayer {
             playback: None,
             monitor_stop: Arc::new(AtomicBool::new(true)),
          })),
-         stream_handle: stream_handle.handle,
-         _stream_keep_alive: stream_handle.keep_alive,
+         output_sink,
          on_changed,
          on_time_update,
       })
@@ -136,21 +159,16 @@ impl RodioAudioPlayer {
    /// Inner load logic that may fail. Separated so `load()` can catch errors
    /// and transition to the Error state before propagating.
    fn load_inner(&self, src: &str, meta: &AudioMetadata) -> Result<PlayerState> {
-      // Fetch audio data (may block on file I/O or HTTP download).
-      let data: Arc<[u8]> = load_source_data(src)?.into();
-
-      // Decode audio and extract duration.
-      let source = Decoder::new(Cursor::new(Arc::clone(&data)))
-         .map_err(|e| Error::Audio(format!("Failed to decode audio: {e}")))?;
+      let descriptor = load_source_descriptor(src)?;
+      let source = open_source(&descriptor)?;
       let duration = source
          .total_duration()
          .map(|d| d.as_secs_f64())
-         .unwrap_or_else(|| probe_duration(&data).unwrap_or(0.0));
+         .unwrap_or(0.0);
 
       // Create a new sink, append the decoded source, and pause immediately
       // so playback waits for an explicit play() call.
-      let sink = Sink::try_new(&self.stream_handle)
-         .map_err(|e| Error::Audio(format!("Failed to create audio sink: {e}")))?;
+      let sink = Player::connect_new(self.output_sink.mixer());
       sink.pause();
       sink.append(source);
 
@@ -168,7 +186,7 @@ impl RodioAudioPlayer {
 
       inner.playback = Some(PlaybackContext {
          sink,
-         source_data: data,
+         source: descriptor,
          duration,
       });
 
@@ -179,20 +197,22 @@ impl RodioAudioPlayer {
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
          let is_ended = inner.state.status == PlaybackStatus::Ended;
+         let mut replayed_from_start = false;
 
          // Re-append source for replay from Ended before the transition
          // mutates status.
          if is_ended
             && let Some(ctx) = &inner.playback
             && ctx.sink.empty()
-            && let Some(source) = decode_arc(&ctx.source_data)
          {
+            let source = open_source(&ctx.source)?;
             ctx.sink.append(source);
+            replayed_from_start = true;
          }
 
          transitions::play(&mut inner.state)?;
 
-         if is_ended {
+         if replayed_from_start {
             inner.state.current_time = 0.0;
          }
 
@@ -251,23 +271,36 @@ impl RodioAudioPlayer {
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
          let was_ended = inner.state.status == PlaybackStatus::Ended;
+         let previous_time = inner.state.current_time;
 
          transitions::seek(&mut inner.state, position)?;
 
          if let Some(ctx) = &inner.playback {
+            let mut reopened_source = false;
+
             // If ended, re-append the source so we have something to seek within.
-            if was_ended {
-               if let Some(source) = decode_arc(&ctx.source_data) {
-                  ctx.sink.append(source);
-               }
+            if was_ended && ctx.sink.empty() {
+               let source = match open_source(&ctx.source) {
+                  Ok(source) => source,
+                  Err(error) => {
+                     inner.state.current_time = previous_time;
+                     return Err(error);
+                  }
+               };
+               ctx.sink.append(source);
                ctx.sink.pause();
+               reopened_source = true;
             }
 
             if let Err(e) = ctx
                .sink
                .try_seek(Duration::from_secs_f64(inner.state.current_time))
             {
-               warn!("Seek failed: {e}");
+               if reopened_source {
+                  ctx.sink.stop();
+               }
+               inner.state.current_time = previous_time;
+               return Err(Error::Audio(format!("Failed to seek audio: {e}")));
             }
          }
 
@@ -334,46 +367,13 @@ impl RodioAudioPlayer {
 }
 
 // ---------------------------------------------------------------------------
-// Audio output thread
+// Audio output
 // ---------------------------------------------------------------------------
 
-struct AudioOutput {
-   handle: OutputStreamHandle,
-   keep_alive: std::sync::mpsc::Sender<()>,
-}
-
-/// Opens the default audio output device on a dedicated thread.
-///
-/// The [`OutputStream`] must remain on the thread that created it (platform
-/// requirement on some backends). We keep it alive via a channel — dropping the
-/// returned sender signals the thread to exit.
-fn open_audio_output() -> Result<AudioOutput> {
-   let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-   let (keep_alive_tx, keep_alive_rx) = std::sync::mpsc::channel::<()>();
-
-   std::thread::Builder::new()
-      .name("audio-output".into())
-      .spawn(move || match OutputStream::try_default() {
-         Ok((_stream, handle)) => {
-            let _ = result_tx.send(Ok(handle));
-            // Block until the keep_alive sender is dropped.
-            let _ = keep_alive_rx.recv();
-         }
-         Err(e) => {
-            let _ = result_tx.send(Err(e));
-         }
-      })
-      .map_err(|e| Error::Audio(format!("Failed to spawn audio thread: {e}")))?;
-
-   let handle = result_rx
-      .recv()
-      .map_err(|_| Error::Audio("Audio thread terminated unexpectedly".into()))?
-      .map_err(|e| Error::Audio(format!("Failed to open audio device: {e}")))?;
-
-   Ok(AudioOutput {
-      handle,
-      keep_alive: keep_alive_tx,
-   })
+/// Opens the default audio output device for playback.
+fn open_audio_output() -> Result<MixerDeviceSink> {
+   DeviceSinkBuilder::open_default_sink()
+      .map_err(|e| Error::Audio(format!("Failed to open audio device: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -397,21 +397,21 @@ fn monitor_loop(
       let mut guard = lock_inner(&inner);
 
       let (pos, duration, is_empty) = match &guard.playback {
-         Some(ctx) => (
-            ctx.sink.get_pos().as_secs_f64(),
-            ctx.duration,
-            ctx.sink.empty(),
-         ),
+         Some(ctx) => {
+            let pos = ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate;
+            (pos, ctx.duration, ctx.sink.empty())
+         }
          None => break,
       };
 
       if is_empty {
          if guard.state.looping {
             // Re-append source for seamless (best-effort) loop.
-            if let Some(ctx) = &guard.playback
-               && let Some(source) = decode_arc(&ctx.source_data)
-            {
-               ctx.sink.append(source);
+            if let Some(ctx) = &guard.playback {
+               match open_source(&ctx.source) {
+                  Ok(source) => ctx.sink.append(source),
+                  Err(e) => warn!("Failed to reopen loop source: {e}"),
+               }
             }
             guard.state.current_time = 0.0;
             drop(guard);
@@ -421,7 +421,7 @@ fn monitor_loop(
             });
          } else {
             guard.state.status = PlaybackStatus::Ended;
-            guard.state.current_time = duration;
+            guard.state.current_time = if duration > 0.0 { duration } else { pos };
             let snapshot = guard.state.clone();
             drop(guard);
             on_changed(&snapshot);
@@ -451,11 +451,6 @@ fn lock_inner(mutex: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Creates a new decoder from shared audio data (cheap Arc clone, no byte copy).
-fn decode_arc(data: &Arc<[u8]>) -> Option<Decoder<Cursor<Arc<[u8]>>>> {
-   Decoder::new(Cursor::new(Arc::clone(data))).ok()
-}
-
 /// Resolves the effective sink volume, accounting for the mute flag.
 fn effective_volume(state: &PlayerState) -> f32 {
    if state.muted {
@@ -465,79 +460,334 @@ fn effective_volume(state: &PlayerState) -> f32 {
    }
 }
 
-/// Probes audio data with symphonia to determine duration from container metadata.
-///
-/// This succeeds for most common formats (MP3, FLAC, WAV, OGG, AAC) where
-/// `rodio::Decoder::total_duration()` returns `None`.
-fn probe_duration(data: &Arc<[u8]>) -> Option<f64> {
-   use symphonia::core::formats::FormatOptions;
-   use symphonia::core::io::MediaSourceStream;
-   use symphonia::core::meta::MetadataOptions;
-   use symphonia::core::probe::Hint;
-
-   let cursor = Cursor::new(Arc::clone(data));
-   let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
-
-   let probed = symphonia::default::get_probe()
-      .format(
-         &Hint::new(),
-         mss,
-         &FormatOptions::default(),
-         &MetadataOptions::default(),
-      )
-      .ok()?;
-
-   let track = probed.format.default_track()?;
-   let time_base = track.codec_params.time_base?;
-   let n_frames = track.codec_params.n_frames?;
-   let time = time_base.calc_time(n_frames);
-
-   Some(time.seconds as f64 + time.frac)
-}
-
-/// Loads raw audio bytes from a file path or HTTP(S) URL.
-fn load_source_data(src: &str) -> Result<Vec<u8>> {
+fn load_source_descriptor(src: &str) -> Result<SourceDescriptor> {
    if src.starts_with("http://") || src.starts_with("https://") {
       reject_private_host(src)?;
-
-      let resp = ureq::AgentBuilder::new()
-         .timeout(HTTP_TIMEOUT)
-         .redirects(0)
-         .build()
-         .get(src)
-         .call()
-         .map_err(|e| Error::Http(format!("Failed to fetch {src}: {e}")))?;
-
-      // Reject early if Content-Length exceeds the limit.
-      if let Some(len) = resp
-         .header("content-length")
-         .and_then(|v| v.parse::<u64>().ok())
-         && len > MAX_DOWNLOAD_BYTES
-      {
-         return Err(Error::Http(format!(
-            "Response too large ({len} bytes, max {MAX_DOWNLOAD_BYTES})"
-         )));
-      }
-
-      // Enforce the limit regardless of Content-Length (it can be absent or spoofed).
-      let mut bytes = Vec::new();
-      resp
-         .into_reader()
-         .take(MAX_DOWNLOAD_BYTES + 1)
-         .read_to_end(&mut bytes)
-         .map_err(Error::Io)?;
-
-      if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-         return Err(Error::Http(format!(
-            "Response exceeded maximum size of {MAX_DOWNLOAD_BYTES} bytes"
-         )));
-      }
-
-      Ok(bytes)
+      Ok(SourceDescriptor::Remote(fetch_remote_source_descriptor(
+         src,
+      )?))
    } else {
       if src.contains("://") || src.starts_with("data:") {
          return Err(Error::Http(format!("Unsupported URL scheme: {src}")));
       }
-      std::fs::read(src).map_err(Error::Io)
+
+      Ok(SourceDescriptor::Local {
+         path: PathBuf::from(src),
+      })
+   }
+}
+
+fn open_source(source: &SourceDescriptor) -> Result<BoxedSource> {
+   match source {
+      SourceDescriptor::Local { path } => {
+         let file = File::open(path).map_err(Error::Io)?;
+         let decoder = Decoder::try_from(file)
+            .map_err(|e| Error::Audio(format!("Failed to decode audio: {e}")))?;
+         Ok(Box::new(decoder))
+      }
+      SourceDescriptor::Remote(remote) => {
+         let mut builder = Decoder::builder()
+            .with_data(HttpAudioReader::new(remote.url.clone(), remote.byte_len))
+            .with_seekable(true);
+
+         if let Some(byte_len) = remote.byte_len {
+            builder = builder.with_byte_len(byte_len);
+         }
+         if let Some(hint) = remote.hint.as_deref() {
+            builder = builder.with_hint(hint);
+         }
+         if let Some(mime_type) = remote.mime_type.as_deref() {
+            builder = builder.with_mime_type(mime_type);
+         }
+
+         let decoder = builder
+            .build()
+            .map_err(|e| Error::Audio(format!("Failed to decode audio: {e}")))?;
+         Ok(Box::new(decoder))
+      }
+   }
+}
+
+fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDescriptor> {
+   let resp = match descriptor_probe_request(src, true) {
+      Ok(resp) => resp,
+      Err(ureq::Error::Status(_, _)) => descriptor_probe_request(src, false)
+         .map_err(|e| Error::Http(format!("Failed to fetch {src}: {e}")))?,
+      Err(e) => return Err(Error::Http(format!("Failed to fetch {src}: {e}"))),
+   };
+
+   Ok(RemoteSourceDescriptor {
+      url: src.to_string(),
+      byte_len: parse_byte_len(&resp),
+      mime_type: resp.header("content-type").map(str::to_string),
+      hint: infer_hint(src),
+   })
+}
+
+fn descriptor_probe_request(src: &str, use_range: bool) -> std::result::Result<ureq::Response, ureq::Error> {
+   let request = http_agent().get(src).set("Accept-Encoding", "identity");
+   let request = if use_range {
+      request.set("Range", "bytes=0-0")
+   } else {
+      request
+   };
+
+   request.call()
+}
+
+fn infer_hint(src: &str) -> Option<String> {
+   let path = src.split('?').next().unwrap_or(src);
+   let path = path.split('#').next().unwrap_or(path);
+
+   PathBuf::from(path)
+      .extension()
+      .and_then(|ext| ext.to_str())
+      .map(|ext| ext.to_ascii_lowercase())
+}
+
+fn http_agent() -> ureq::Agent {
+   ureq::AgentBuilder::new()
+      .timeout(HTTP_TIMEOUT)
+      .redirects(0)
+      .build()
+}
+
+fn parse_byte_len(resp: &ureq::Response) -> Option<u64> {
+   resp
+      .header("content-range")
+      .and_then(parse_content_range_len)
+      .or_else(|| {
+         resp
+            .header("content-length")
+            .and_then(|value| value.parse::<u64>().ok())
+      })
+}
+
+fn parse_content_range_len(value: &str) -> Option<u64> {
+   value.rsplit('/').next()?.parse::<u64>().ok()
+}
+
+fn open_http_stream(url: &str, position: u64) -> Result<(HttpResponseReader, Option<u64>)> {
+   let request = http_agent().get(url).set("Accept-Encoding", "identity");
+   let request = if position > 0 {
+      request.set("Range", &format!("bytes={position}-"))
+   } else {
+      request
+   };
+
+   let resp = request
+      .call()
+      .map_err(|e| Error::Http(format!("Failed to fetch {url}: {e}")))?;
+   let status = resp.status();
+   let byte_len = parse_byte_len(&resp);
+   let mut reader = HttpResponseReader::new(resp);
+
+   if position > 0 && status != 206 {
+      skip_bytes(&mut reader, position).map_err(Error::Io)?;
+   }
+
+   Ok((reader, byte_len))
+}
+
+fn skip_bytes<R: Read>(reader: &mut R, mut remaining: u64) -> std::io::Result<()> {
+   let mut buffer = [0_u8; 8192];
+
+   while remaining > 0 {
+      let chunk_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+      let read = reader.read(&mut buffer[..chunk_len])?;
+      if read == 0 {
+         return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Unexpected EOF while skipping remote stream",
+         ));
+      }
+      remaining -= read as u64;
+   }
+
+   Ok(())
+}
+
+fn http_to_io_error(error: Error) -> std::io::Error {
+   std::io::Error::other(error.to_string())
+}
+
+impl HttpResponseReader {
+   fn new(response: ureq::Response) -> Self {
+      Self {
+         inner: Mutex::new(Box::new(response.into_reader())),
+      }
+   }
+}
+
+impl Read for HttpResponseReader {
+   fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      self
+         .inner
+         .lock()
+         .unwrap_or_else(|e| e.into_inner())
+         .read(buf)
+   }
+}
+
+impl HttpAudioReader {
+   fn new(url: String, byte_len: Option<u64>) -> Self {
+      Self {
+         url,
+         position: 0,
+         byte_len,
+         reader: None,
+         reached_eof: false,
+      }
+   }
+
+   fn ensure_reader(&mut self) -> std::io::Result<()> {
+      if self.reader.is_none() && !self.reached_eof {
+         let (reader, byte_len) =
+            open_http_stream(&self.url, self.position).map_err(http_to_io_error)?;
+         if self.byte_len.is_none() {
+            self.byte_len = byte_len;
+         }
+         self.reader = Some(reader);
+      }
+
+      Ok(())
+   }
+}
+
+impl Read for HttpAudioReader {
+   fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      self.ensure_reader()?;
+
+      let Some(reader) = &mut self.reader else {
+         return Ok(0);
+      };
+
+      let read = reader.read(buf)?;
+      if read == 0 {
+         self.reader = None;
+         self.reached_eof = true;
+      } else {
+         self.position += read as u64;
+      }
+
+      Ok(read)
+   }
+}
+
+impl Seek for HttpAudioReader {
+   fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+      let next = match position {
+         SeekFrom::Start(offset) => offset as i128,
+         SeekFrom::Current(offset) => self.position as i128 + offset as i128,
+         SeekFrom::End(offset) => match self.byte_len {
+            Some(byte_len) => byte_len as i128 + offset as i128,
+            None => {
+               return Err(std::io::Error::new(
+                  std::io::ErrorKind::Unsupported,
+                  "Cannot seek from end without a known content length",
+               ));
+            }
+         },
+      };
+
+      if next < 0 {
+         return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Cannot seek before the start of the stream",
+         ));
+      }
+
+      self.position = next as u64;
+      self.reader = None;
+      self.reached_eof = false;
+      Ok(self.position)
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   use std::io::{Read, Write};
+   use std::net::TcpListener;
+   use std::sync::mpsc;
+   use std::thread;
+
+   fn spawn_http_server(
+      responses: Vec<(String, Vec<u8>)>,
+   ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      let base_url = format!("http://{}", listener.local_addr().unwrap());
+      let (request_tx, request_rx) = mpsc::channel();
+
+      let handle = thread::spawn(move || {
+         for (head, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+
+            loop {
+               let read = stream.read(&mut buffer).unwrap();
+               if read == 0 {
+                  break;
+               }
+               request.extend_from_slice(&buffer[..read]);
+               if request.windows(4).any(|chunk| chunk == b"\r\n\r\n") {
+                  break;
+               }
+            }
+
+            request_tx
+               .send(String::from_utf8_lossy(&request).into_owned())
+               .unwrap();
+
+            let response = format!(
+               "{head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+               body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+         }
+      });
+
+      (base_url, request_rx, handle)
+   }
+
+   #[test]
+   fn fetch_remote_source_descriptor_falls_back_to_plain_request() {
+      let responses = vec![
+         ("HTTP/1.1 416 Range Not Satisfiable".to_string(), Vec::new()),
+         (
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg".to_string(),
+            b"abcde".to_vec(),
+         ),
+      ];
+      let (url, request_rx, handle) = spawn_http_server(responses);
+
+      let descriptor = fetch_remote_source_descriptor(&url).unwrap();
+      let first_request = request_rx.recv().unwrap();
+      let second_request = request_rx.recv().unwrap();
+      handle.join().unwrap();
+
+      assert!(first_request.contains("Range: bytes=0-0"));
+      assert!(!second_request.contains("Range:"));
+      assert_eq!(descriptor.byte_len, Some(5));
+      assert_eq!(descriptor.mime_type.as_deref(), Some("audio/mpeg"));
+   }
+
+   #[test]
+   fn open_http_stream_skips_bytes_when_server_ignores_range() {
+      let responses = vec![("HTTP/1.1 200 OK".to_string(), b"abcdef".to_vec())];
+      let (url, request_rx, handle) = spawn_http_server(responses);
+
+      let (mut reader, byte_len) = open_http_stream(&url, 2).unwrap();
+      let mut bytes = Vec::new();
+      reader.read_to_end(&mut bytes).unwrap();
+      let request = request_rx.recv().unwrap();
+      handle.join().unwrap();
+
+      assert!(request.contains("Range: bytes=2-"));
+      assert_eq!(byte_len, Some(6));
+      assert_eq!(bytes, b"cdef");
    }
 }

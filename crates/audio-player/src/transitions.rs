@@ -139,7 +139,11 @@ pub fn seek(state: &mut PlayerState, position: f64) -> Result<()> {
          )));
       }
    }
-   state.current_time = position.clamp(0.0, state.duration);
+   state.current_time = if state.duration.is_finite() && state.duration > 0.0 {
+      position.clamp(0.0, state.duration)
+   } else {
+      position.max(0.0)
+   };
    Ok(())
 }
 
@@ -539,6 +543,13 @@ mod tests {
       let mut s = state_with_duration(PlaybackStatus::Playing, 120.0);
       seek(&mut s, 999.0).unwrap();
       assert_eq!(s.current_time, 120.0);
+   }
+
+   #[test]
+   fn seek_does_not_clamp_when_duration_unknown() {
+      let mut s = state_with_duration(PlaybackStatus::Ready, 0.0);
+      seek(&mut s, 45.0).unwrap();
+      assert_eq!(s.current_time, 45.0);
    }
 
    #[test]
