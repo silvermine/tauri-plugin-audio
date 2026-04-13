@@ -649,7 +649,9 @@ fn descriptor_probe_request(
    src: &str,
    use_range: bool,
 ) -> std::result::Result<ureq::Response, Box<ureq::Error>> {
-   let request = http_agent().get(src).set("Accept-Encoding", "identity");
+   let request = descriptor_http_agent()
+      .get(src)
+      .set("Accept-Encoding", "identity");
    let request = if use_range {
       request.set("Range", "bytes=0-0")
    } else {
@@ -673,11 +675,15 @@ fn infer_hint_from_path(path: &Path) -> Option<String> {
       .map(|ext| ext.to_ascii_lowercase())
 }
 
-fn http_agent() -> ureq::Agent {
+fn descriptor_http_agent() -> ureq::Agent {
    ureq::AgentBuilder::new()
       .timeout(HTTP_TIMEOUT)
       .redirects(0)
       .build()
+}
+
+fn stream_http_agent() -> ureq::Agent {
+   ureq::AgentBuilder::new().redirects(0).build()
 }
 
 fn parse_byte_len(resp: &ureq::Response) -> Option<u64> {
@@ -696,7 +702,9 @@ fn parse_content_range_len(value: &str) -> Option<u64> {
 }
 
 fn open_http_stream(url: &str, position: u64) -> Result<(HttpResponseReader, Option<u64>)> {
-   let request = http_agent().get(url).set("Accept-Encoding", "identity");
+   let request = stream_http_agent()
+      .get(url)
+      .set("Accept-Encoding", "identity");
    let request = if position > 0 {
       request.set("Range", &format!("bytes={position}-"))
    } else {
