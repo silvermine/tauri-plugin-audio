@@ -539,8 +539,7 @@ fn monitor_loop(
 
       let (pos, duration, is_empty) = match &guard.playback {
          Some(ctx) => {
-            let pos =
-               ctx.position_offset + (ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate);
+            let pos = ctx.position_offset + ctx.sink.get_pos().as_secs_f64();
             (pos, ctx.duration, ctx.sink.empty())
          }
          None => break,
@@ -587,6 +586,7 @@ fn monitor_loop(
 // Helpers
 // ---------------------------------------------------------------------------
 
+
 /// Acquires the mutex, recovering from poisoning instead of panicking.
 ///
 /// A poisoned mutex means a thread panicked while holding the lock. The inner
@@ -608,18 +608,18 @@ fn effective_volume(state: &PlayerState) -> f32 {
 fn load_source_descriptor(src: &str) -> Result<SourceDescriptor> {
    if src.starts_with("http://") || src.starts_with("https://") {
       reject_private_host(src)?;
-      Ok(SourceDescriptor::Remote(fetch_remote_source_descriptor(
+      return Ok(SourceDescriptor::Remote(fetch_remote_source_descriptor(
          src,
-      )?))
-   } else {
-      if src.contains("://") || src.starts_with("data:") {
-         return Err(Error::Http(format!("Unsupported URL scheme: {src}")));
-      }
-
-      Ok(SourceDescriptor::Local {
-         path: PathBuf::from(src),
-      })
+      )?));
    }
+
+   if src.contains("://") || src.starts_with("data:") {
+      return Err(Error::Http(format!("Unsupported URL scheme: {src}")));
+   }
+
+   Ok(SourceDescriptor::Local {
+      path: PathBuf::from(src),
+   })
 }
 
 fn open_source(source: &SourceDescriptor) -> Result<BoxedSource> {
@@ -792,9 +792,11 @@ impl HttpAudioReader {
       if self.reader.is_none() && !self.reached_eof {
          let (reader, byte_len) = open_http_stream(&self.url, self.position)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+
          if self.byte_len.is_none() {
             self.byte_len = byte_len;
          }
+
          self.reader = Some(reader);
       }
 
@@ -807,15 +809,16 @@ impl Read for HttpAudioReader {
       self.ensure_reader()?;
 
       let Some(reader) = &mut self.reader else {
+         self.reached_eof = true;
          return Ok(0);
       };
 
       let read = reader.read(buf)?;
+      self.position += read as u64;
+
       if read == 0 {
          self.reader = None;
          self.reached_eof = true;
-      } else {
-         self.position += read as u64;
       }
 
       Ok(read)
@@ -855,9 +858,14 @@ impl Seek for HttpAudioReader {
          ));
       }
 
-      self.position = next as u64;
-      self.reader = None;
-      self.reached_eof = false;
+      let next = next as u64;
+
+      if next != self.position {
+         self.position = next;
+         self.reader = None;
+         self.reached_eof = false;
+      }
+
       Ok(self.position)
    }
 }
