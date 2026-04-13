@@ -110,6 +110,7 @@ version = "0.1.0"
 dependencies = [
  "rodio",
  "serde",
+ "symphonia",
  "thiserror 2.0.18",
  "tracing",
  "ureq",
@@ -2897,7 +2898,6 @@ dependencies = [
  "cpal",
  "dasp_sample",
  "num-rational",
- "symphonia",
  "thiserror 2.0.18",
 ]
 

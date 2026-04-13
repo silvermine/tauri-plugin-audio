@@ -40,7 +40,12 @@ pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> R
 /// Finalizes prepare by transitioning from `Loading` to `Ready` with the
 /// decoded duration. Also accepts `Idle`, `Ended`, and `Error` in case
 /// `begin_load` was skipped (e.g. instant local file loads).
-pub fn prepare(state: &mut PlayerState, src: &str, meta: &AudioMetadata, duration: f64) -> Result<()> {
+pub fn prepare(
+   state: &mut PlayerState,
+   src: &str,
+   meta: &AudioMetadata,
+   duration: f64,
+) -> Result<()> {
    match state.status {
       PlaybackStatus::Loading
       | PlaybackStatus::Idle

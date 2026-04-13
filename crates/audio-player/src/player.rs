@@ -1,12 +1,24 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::num::{NonZeroU16, NonZeroU32};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use rodio::source::SeekError as RodioSeekError;
 use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
-use rodio::{Decoder, Player, Sample, Source};
+use rodio::{Player, Sample, Source};
+use symphonia::core::audio::SampleBuffer as SymphoniaSampleBuffer;
+use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder as SymphoniaDecoderTrait, DecoderOptions};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::{
+   FormatOptions, FormatReader as SymphoniaFormatReader, SeekMode, SeekTo,
+};
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::core::units::{Time, TimeBase};
 use tracing::warn;
 
 use crate::error::{Error, Result};
@@ -39,6 +51,7 @@ struct PlaybackContext {
    sink: Player,
    source: SourceDescriptor,
    duration: f64,
+   position_offset: f64,
 }
 
 #[derive(Clone)]
@@ -68,6 +81,23 @@ struct HttpResponseReader {
 }
 
 type BoxedSource = Box<dyn Source<Item = Sample> + Send>;
+type SymphoniaDecoder = Box<dyn SymphoniaDecoderTrait>;
+type SymphoniaFormat = Box<dyn SymphoniaFormatReader>;
+
+struct SymphoniaSource {
+   format: SymphoniaFormat,
+   decoder: SymphoniaDecoder,
+   track_id: u32,
+   channels: NonZeroU16,
+   sample_rate: NonZeroU32,
+   total_duration: Option<Duration>,
+   time_base: TimeBase,
+   sample_buffer: Option<SymphoniaSampleBuffer<f32>>,
+   pending_samples: Vec<f32>,
+   pending_index: usize,
+   pending_seek_ts: Option<u64>,
+   exhausted: bool,
+}
 
 impl RodioAudioPlayer {
    /// Creates a new Rodio-backed audio player.
@@ -124,7 +154,11 @@ impl RodioAudioPlayer {
       lock_inner(&self.inner).state.clone()
    }
 
-   pub fn prepare(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
+   pub fn prepare(
+      &self,
+      src: &str,
+      metadata: Option<AudioMetadata>,
+   ) -> Result<AudioActionResponse> {
       let meta = metadata.unwrap_or_default();
 
       // Transition to Loading and notify the frontend before starting I/O.
@@ -188,6 +222,7 @@ impl RodioAudioPlayer {
          sink,
          source: descriptor,
          duration,
+         position_offset: 0.0,
       });
 
       Ok(inner.state.clone())
@@ -202,11 +237,12 @@ impl RodioAudioPlayer {
          // Re-append source for replay from Ended before the transition
          // mutates status.
          if is_ended
-            && let Some(ctx) = &inner.playback
+            && let Some(ctx) = &mut inner.playback
             && ctx.sink.empty()
          {
             let source = open_source(&ctx.source)?;
             ctx.sink.append(source);
+            ctx.position_offset = 0.0;
             replayed_from_start = true;
          }
 
@@ -275,33 +311,18 @@ impl RodioAudioPlayer {
 
          transitions::seek(&mut inner.state, position)?;
 
-         if let Some(ctx) = &inner.playback {
-            let mut reopened_source = false;
-
-            // If ended, re-append the source so we have something to seek within.
-            if was_ended && ctx.sink.empty() {
-               let source = match open_source(&ctx.source) {
-                  Ok(source) => source,
-                  Err(error) => {
-                     inner.state.current_time = previous_time;
-                     return Err(error);
-                  }
-               };
-               ctx.sink.append(source);
-               ctx.sink.pause();
-               reopened_source = true;
-            }
-
-            if let Err(e) = ctx
-               .sink
-               .try_seek(Duration::from_secs_f64(inner.state.current_time))
-            {
-               if reopened_source {
-                  ctx.sink.stop();
-               }
-               inner.state.current_time = previous_time;
-               return Err(Error::Audio(format!("Failed to seek audio: {e}")));
-            }
+         if let Some((source_descriptor, duration)) = inner
+            .playback
+            .as_ref()
+            .map(|ctx| (ctx.source.clone(), ctx.duration))
+         {
+            self.seek_playback(
+               &mut inner,
+               source_descriptor,
+               duration,
+               was_ended,
+               previous_time,
+            )?;
          }
 
          inner.state.clone()
@@ -310,6 +331,114 @@ impl RodioAudioPlayer {
       let expected = snapshot.status;
       (self.on_changed)(&snapshot);
       Ok(AudioActionResponse::new(snapshot, expected))
+   }
+
+   fn seek_playback(
+      &self,
+      inner: &mut Inner,
+      source_descriptor: SourceDescriptor,
+      duration: f64,
+      was_ended: bool,
+      previous_time: f64,
+   ) -> Result<()> {
+      match &source_descriptor {
+         SourceDescriptor::Remote(_) => {
+            self.seek_remote_playback(inner, source_descriptor, duration, previous_time)
+         }
+         SourceDescriptor::Local { .. } => {
+            Self::seek_local_playback(inner, &source_descriptor, was_ended, previous_time)
+         }
+      }
+   }
+
+   fn seek_remote_playback(
+      &self,
+      inner: &mut Inner,
+      source_descriptor: SourceDescriptor,
+      duration: f64,
+      previous_time: f64,
+   ) -> Result<()> {
+      let was_playing = inner.state.status == PlaybackStatus::Playing;
+      let current_volume = effective_volume(&inner.state);
+      let target_time = inner.state.current_time;
+
+      if let Some(ctx) = &inner.playback {
+         ctx.sink.set_volume(0.0);
+         ctx.sink.pause();
+      }
+
+      let source = match open_source_at(&source_descriptor, target_time) {
+         Ok(source) => source,
+         Err(error) => {
+            if let Some(ctx) = &inner.playback {
+               ctx.sink.set_volume(current_volume);
+               if was_playing {
+                  ctx.sink.play();
+               }
+            }
+            inner.state.current_time = previous_time;
+            return Err(error);
+         }
+      };
+
+      let sink = Player::connect_new(self.output_sink.mixer());
+      sink.pause();
+      sink.append(source);
+      sink.set_volume(current_volume);
+      sink.set_speed(inner.state.playback_rate as f32);
+
+      if let Some(previous_playback) = inner.playback.replace(PlaybackContext {
+         sink,
+         source: source_descriptor,
+         duration,
+         position_offset: target_time,
+      }) {
+         previous_playback.sink.stop();
+      }
+
+      if was_playing && let Some(ctx) = &inner.playback {
+         ctx.sink.play();
+      }
+
+      Ok(())
+   }
+
+   fn seek_local_playback(
+      inner: &mut Inner,
+      source_descriptor: &SourceDescriptor,
+      was_ended: bool,
+      previous_time: f64,
+   ) -> Result<()> {
+      let Some(ctx) = &inner.playback else {
+         unreachable!("Playback context disappeared during local seek");
+      };
+      let mut reopened_source = false;
+
+      if was_ended && ctx.sink.empty() {
+         let source = match open_source(source_descriptor) {
+            Ok(source) => source,
+            Err(error) => {
+               inner.state.current_time = previous_time;
+               return Err(error);
+            }
+         };
+         ctx.sink.append(source);
+         ctx.sink.pause();
+         reopened_source = true;
+      }
+
+      if let Err(e) = ctx
+         .sink
+         .try_seek(Duration::from_secs_f64(inner.state.current_time))
+      {
+         if reopened_source {
+            ctx.sink.stop();
+         }
+         inner.state.current_time = previous_time;
+         return Err(Error::Audio(format!("Failed to seek audio: {e}")));
+      }
+
+      Ok(())
    }
 
    pub fn set_volume(&self, level: f64) -> Result<PlayerState> {
@@ -398,7 +527,8 @@ fn monitor_loop(
 
       let (pos, duration, is_empty) = match &guard.playback {
          Some(ctx) => {
-            let pos = ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate;
+            let pos =
+               ctx.position_offset + (ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate);
             (pos, ctx.duration, ctx.sink.empty())
          }
          None => break,
@@ -407,9 +537,12 @@ fn monitor_loop(
       if is_empty {
          if guard.state.looping {
             // Re-append source for seamless (best-effort) loop.
-            if let Some(ctx) = &guard.playback {
+            if let Some(ctx) = &mut guard.playback {
                match open_source(&ctx.source) {
-                  Ok(source) => ctx.sink.append(source),
+                  Ok(source) => {
+                     ctx.sink.append(source);
+                     ctx.position_offset = 0.0;
+                  }
                   Err(e) => warn!("Failed to reopen loop source: {e}"),
                }
             }
@@ -478,42 +611,30 @@ fn load_source_descriptor(src: &str) -> Result<SourceDescriptor> {
 }
 
 fn open_source(source: &SourceDescriptor) -> Result<BoxedSource> {
+   open_source_at(source, 0.0)
+}
+
+fn open_source_at(source: &SourceDescriptor, position: f64) -> Result<BoxedSource> {
    match source {
-      SourceDescriptor::Local { path } => {
-         let file = File::open(path).map_err(Error::Io)?;
-         let decoder = Decoder::try_from(file)
-            .map_err(|e| Error::Audio(format!("Failed to decode audio: {e}")))?;
-         Ok(Box::new(decoder))
-      }
-      SourceDescriptor::Remote(remote) => {
-         let mut builder = Decoder::builder()
-            .with_data(HttpAudioReader::new(remote.url.clone(), remote.byte_len))
-            .with_seekable(true);
-
-         if let Some(byte_len) = remote.byte_len {
-            builder = builder.with_byte_len(byte_len);
-         }
-         if let Some(hint) = remote.hint.as_deref() {
-            builder = builder.with_hint(hint);
-         }
-         if let Some(mime_type) = remote.mime_type.as_deref() {
-            builder = builder.with_mime_type(mime_type);
-         }
-
-         let decoder = builder
-            .build()
-            .map_err(|e| Error::Audio(format!("Failed to decode audio: {e}")))?;
-         Ok(Box::new(decoder))
-      }
+      SourceDescriptor::Local { path } => Ok(Box::new(SymphoniaSource::new_local(
+         path,
+         Duration::from_secs_f64(position.max(0.0)),
+      )?)),
+      SourceDescriptor::Remote(remote) => Ok(Box::new(SymphoniaSource::new_remote(
+         remote,
+         Duration::from_secs_f64(position.max(0.0)),
+      )?)),
    }
 }
 
 fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDescriptor> {
    let resp = match descriptor_probe_request(src, true) {
       Ok(resp) => resp,
-      Err(ureq::Error::Status(_, _)) => descriptor_probe_request(src, false)
-         .map_err(|e| Error::Http(format!("Failed to fetch {src}: {e}")))?,
-      Err(e) => return Err(Error::Http(format!("Failed to fetch {src}: {e}"))),
+      Err(error) if matches!(error.as_ref(), ureq::Error::Status(_, _)) => {
+         descriptor_probe_request(src, false)
+            .map_err(|e| Error::Http(format!("Failed to fetch {src}: {e}")))?
+      }
+      Err(error) => return Err(Error::Http(format!("Failed to fetch {src}: {error}"))),
    };
 
    Ok(RemoteSourceDescriptor {
@@ -524,7 +645,10 @@ fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDescriptor> {
    })
 }
 
-fn descriptor_probe_request(src: &str, use_range: bool) -> std::result::Result<ureq::Response, ureq::Error> {
+fn descriptor_probe_request(
+   src: &str,
+   use_range: bool,
+) -> std::result::Result<ureq::Response, Box<ureq::Error>> {
    let request = http_agent().get(src).set("Accept-Encoding", "identity");
    let request = if use_range {
       request.set("Range", "bytes=0-0")
@@ -532,14 +656,18 @@ fn descriptor_probe_request(src: &str, use_range: bool) -> std::result::Result<u
       request
    };
 
-   request.call()
+   request.call().map_err(Box::new)
 }
 
 fn infer_hint(src: &str) -> Option<String> {
    let path = src.split('?').next().unwrap_or(src);
    let path = path.split('#').next().unwrap_or(path);
 
-   PathBuf::from(path)
+   infer_hint_from_path(Path::new(path))
+}
+
+fn infer_hint_from_path(path: &Path) -> Option<String> {
+   path
       .extension()
       .and_then(|ext| ext.to_str())
       .map(|ext| ext.to_ascii_lowercase())
@@ -607,10 +735,6 @@ fn skip_bytes<R: Read>(reader: &mut R, mut remaining: u64) -> std::io::Result<()
    Ok(())
 }
 
-fn http_to_io_error(error: Error) -> std::io::Error {
-   std::io::Error::other(error.to_string())
-}
-
 impl HttpResponseReader {
    fn new(response: ureq::Response) -> Self {
       Self {
@@ -642,8 +766,8 @@ impl HttpAudioReader {
 
    fn ensure_reader(&mut self) -> std::io::Result<()> {
       if self.reader.is_none() && !self.reached_eof {
-         let (reader, byte_len) =
-            open_http_stream(&self.url, self.position).map_err(http_to_io_error)?;
+         let (reader, byte_len) = open_http_stream(&self.url, self.position)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
          if self.byte_len.is_none() {
             self.byte_len = byte_len;
          }
@@ -674,6 +798,16 @@ impl Read for HttpAudioReader {
    }
 }
 
+impl MediaSource for HttpAudioReader {
+   fn is_seekable(&self) -> bool {
+      true
+   }
+
+   fn byte_len(&self) -> Option<u64> {
+      self.byte_len
+   }
+}
+
 impl Seek for HttpAudioReader {
    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
       let next = match position {
@@ -701,6 +835,283 @@ impl Seek for HttpAudioReader {
       self.reader = None;
       self.reached_eof = false;
       Ok(self.position)
+   }
+}
+
+impl SymphoniaSource {
+   fn new_local(path: &Path, start_time: Duration) -> Result<Self> {
+      let media_source = File::open(path).map_err(Error::Io)?;
+      let hint = infer_hint_from_path(path);
+      Self::new(Box::new(media_source), hint.as_deref(), None, start_time)
+   }
+
+   fn new_remote(remote: &RemoteSourceDescriptor, start_time: Duration) -> Result<Self> {
+      let media_source = HttpAudioReader::new(remote.url.clone(), remote.byte_len);
+      Self::new(
+         Box::new(media_source),
+         remote.hint.as_deref(),
+         remote.mime_type.as_deref(),
+         start_time,
+      )
+   }
+
+   fn new(
+      media_source: Box<dyn MediaSource>,
+      extension_hint: Option<&str>,
+      mime_type_hint: Option<&str>,
+      start_time: Duration,
+   ) -> Result<Self> {
+      let mut hint = Hint::new();
+      if let Some(extension) = extension_hint {
+         hint.with_extension(extension);
+      }
+      if let Some(mime_type) = mime_type_hint {
+         hint.mime_type(mime_type);
+      }
+
+      let stream = MediaSourceStream::new(media_source, MediaSourceStreamOptions::default());
+      let format_options = FormatOptions {
+         enable_gapless: true,
+         ..FormatOptions::default()
+      };
+      let probed = symphonia::default::get_probe()
+         .format(&hint, stream, &format_options, &MetadataOptions::default())
+         .map_err(|error| Error::Audio(format!("Failed to probe audio source: {error}")))?;
+      let format = probed.format;
+      let track = format
+         .default_track()
+         .cloned()
+         .or_else(|| format.tracks().first().cloned())
+         .ok_or_else(|| Error::Audio("Audio source contained no playable tracks".into()))?;
+
+      if track.codec_params.codec == CODEC_TYPE_NULL {
+         return Err(Error::Audio("Audio track has no supported codec".into()));
+      }
+
+      let decoder = symphonia::default::get_codecs()
+         .make(&track.codec_params, &DecoderOptions::default())
+         .map_err(|error| Error::Audio(format!("Failed to open audio decoder: {error}")))?;
+      let sample_rate = NonZeroU32::new(track.codec_params.sample_rate.unwrap_or(44_100))
+         .unwrap_or(NonZeroU32::MIN);
+      let channels = track
+         .codec_params
+         .channels
+         .and_then(|value| NonZeroU16::new(value.count() as u16))
+         .unwrap_or(NonZeroU16::MIN.saturating_add(1));
+      let time_base = track
+         .codec_params
+         .time_base
+         .unwrap_or_else(|| TimeBase::new(1, sample_rate.get()));
+      let total_duration = track
+         .codec_params
+         .n_frames
+         .map(|frames| Duration::from(time_base.calc_time(frames)));
+
+      let mut source = Self {
+         format,
+         decoder,
+         track_id: track.id,
+         channels,
+         sample_rate,
+         total_duration,
+         time_base,
+         sample_buffer: None,
+         pending_samples: Vec::new(),
+         pending_index: 0,
+         pending_seek_ts: None,
+         exhausted: false,
+      };
+
+      if start_time > Duration::ZERO {
+         source.seek_internal(start_time)?;
+      }
+
+      Ok(source)
+   }
+
+   fn fill_pending_samples(&mut self) -> Result<bool> {
+      if self.pending_index < self.pending_samples.len() {
+         return Ok(true);
+      }
+
+      self.pending_samples.clear();
+      self.pending_index = 0;
+
+      while !self.exhausted {
+         let packet = match self.format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error))
+               if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+               self.exhausted = true;
+               return Ok(false);
+            }
+            Err(SymphoniaError::ResetRequired) => {
+               self.exhausted = true;
+               return Err(Error::Audio("Audio format changed unexpectedly".into()));
+            }
+            Err(error) => {
+               self.exhausted = true;
+               return Err(Error::Audio(format!(
+                  "Failed to read audio packet: {error}"
+               )));
+            }
+         };
+
+         if packet.track_id() != self.track_id {
+            continue;
+         }
+
+         let packet_ts = packet.ts();
+         let packet_end_ts = packet_ts.saturating_add(packet.dur());
+         let decoded = match self.decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::IoError(_)) => continue,
+            Err(SymphoniaError::ResetRequired) => {
+               self.decoder.reset();
+               continue;
+            }
+            Err(error) => {
+               self.exhausted = true;
+               return Err(Error::Audio(format!(
+                  "Failed to decode audio packet: {error}"
+               )));
+            }
+         };
+
+         let spec = *decoded.spec();
+         if let Some(channels) = NonZeroU16::new(spec.channels.count() as u16) {
+            self.channels = channels;
+         }
+         if let Some(sample_rate) = NonZeroU32::new(spec.rate) {
+            self.sample_rate = sample_rate;
+         }
+
+         let mut trim_start_frames = packet.trim_start as usize;
+         let trim_end_frames = packet.trim_end as usize;
+
+         if let Some(target_ts) = self.pending_seek_ts {
+            if packet_end_ts <= target_ts {
+               continue;
+            }
+
+            if packet_ts < target_ts {
+               let delta_duration = Duration::from(self.time_base.calc_time(target_ts - packet_ts));
+               let delta_frames =
+                  (delta_duration.as_secs_f64() * self.sample_rate.get() as f64).floor() as usize;
+               trim_start_frames = trim_start_frames.max(delta_frames);
+            }
+
+            self.pending_seek_ts = None;
+         }
+
+         if trim_start_frames + trim_end_frames >= decoded.frames() {
+            continue;
+         }
+
+         let required_capacity = decoded.frames() * spec.channels.count();
+         if self
+            .sample_buffer
+            .as_ref()
+            .map(|buffer| buffer.capacity() < required_capacity)
+            .unwrap_or(true)
+         {
+            self.sample_buffer = Some(SymphoniaSampleBuffer::new(decoded.capacity() as u64, spec));
+         }
+
+         let Some(sample_buffer) = &mut self.sample_buffer else {
+            continue;
+         };
+
+         sample_buffer.copy_interleaved_ref(decoded);
+         let channel_count = spec.channels.count();
+         let trim_start_samples = trim_start_frames * channel_count;
+         let trim_end_samples = trim_end_frames * channel_count;
+         let samples = sample_buffer.samples();
+         let end_index = samples.len().saturating_sub(trim_end_samples);
+
+         if trim_start_samples >= end_index {
+            continue;
+         }
+
+         self
+            .pending_samples
+            .extend_from_slice(&samples[trim_start_samples..end_index]);
+         return Ok(true);
+      }
+
+      Ok(false)
+   }
+
+   fn seek_internal(&mut self, position: Duration) -> Result<()> {
+      let target_position = self
+         .total_duration
+         .map(|duration| position.min(duration))
+         .unwrap_or(position);
+      let seeked_to = self
+         .format
+         .seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+               time: Time::from(target_position.as_secs_f64()),
+               track_id: Some(self.track_id),
+            },
+         )
+         .map_err(|error| Error::Audio(format!("Failed to seek audio source: {error}")))?;
+
+      self.decoder.reset();
+      self.pending_samples.clear();
+      self.pending_index = 0;
+      self.pending_seek_ts = Some(seeked_to.required_ts);
+      self.exhausted = false;
+
+      Ok(())
+   }
+}
+
+impl Iterator for SymphoniaSource {
+   type Item = Sample;
+
+   fn next(&mut self) -> Option<Self::Item> {
+      if self.pending_index >= self.pending_samples.len() {
+         match self.fill_pending_samples() {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+               warn!("Failed to stream audio via Symphonia: {error}");
+               return None;
+            }
+         }
+      }
+
+      let sample = *self.pending_samples.get(self.pending_index)?;
+      self.pending_index += 1;
+      Some(sample)
+   }
+}
+
+impl Source for SymphoniaSource {
+   fn current_span_len(&self) -> Option<usize> {
+      None
+   }
+
+   fn channels(&self) -> rodio::ChannelCount {
+      self.channels
+   }
+
+   fn sample_rate(&self) -> rodio::SampleRate {
+      self.sample_rate
+   }
+
+   fn total_duration(&self) -> Option<Duration> {
+      self.total_duration
+   }
+
+   fn try_seek(&mut self, position: Duration) -> std::result::Result<(), RodioSeekError> {
+      self
+         .seek_internal(position)
+         .map_err(|error| RodioSeekError::Other(Arc::new(std::io::Error::other(error.to_string()))))
    }
 }
 
