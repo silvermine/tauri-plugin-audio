@@ -45,6 +45,7 @@ struct Inner {
    state: PlayerState,
    playback: Option<PlaybackContext>,
    monitor_stop: Arc<AtomicBool>,
+   load_generation: u64,
 }
 
 struct PlaybackContext {
@@ -113,6 +114,7 @@ impl RodioAudioPlayer {
             state: PlayerState::default(),
             playback: None,
             monitor_stop: Arc::new(AtomicBool::new(true)),
+            load_generation: 0,
          })),
          output_sink,
          on_changed,
@@ -161,18 +163,18 @@ impl RodioAudioPlayer {
    ) -> Result<AudioActionResponse> {
       let meta = metadata.unwrap_or_default();
 
-      // Transition to Loading and notify the frontend before starting I/O.
-      {
+      let load_generation = {
          let mut inner = lock_inner(&self.inner);
          transitions::begin_load(&mut inner.state, src, &meta)?;
+         inner.load_generation = inner.load_generation.wrapping_add(1);
+         let load_generation = inner.load_generation;
          let snapshot = inner.state.clone();
          drop(inner);
          (self.on_changed)(&snapshot);
-      }
+         load_generation
+      };
 
-      // Perform I/O, decoding, and sink creation. If any step fails,
-      // transition to Error so the frontend can recover from the Loading state.
-      let result = self.prepare_inner(src, &meta);
+      let result = self.prepare_inner(src, &meta, load_generation);
 
       match result {
          Ok(snapshot) => {
@@ -181,6 +183,11 @@ impl RodioAudioPlayer {
          }
          Err(e) => {
             let mut inner = lock_inner(&self.inner);
+
+            if inner.load_generation != load_generation {
+               return Err(Error::InvalidState("Prepare request was canceled".into()));
+            }
+
             transitions::error(&mut inner.state, e.to_string());
             let snapshot = inner.state.clone();
             drop(inner);
@@ -192,7 +199,12 @@ impl RodioAudioPlayer {
 
    /// Inner prepare logic that may fail. Separated so `prepare()` can catch errors
    /// and transition to the Error state before propagating.
-   fn prepare_inner(&self, src: &str, meta: &AudioMetadata) -> Result<PlayerState> {
+   fn prepare_inner(
+      &self,
+      src: &str,
+      meta: &AudioMetadata,
+      load_generation: u64,
+   ) -> Result<PlayerState> {
       let descriptor = load_source_descriptor(src)?;
       let source = open_source(&descriptor)?;
       let duration = source
@@ -206,15 +218,16 @@ impl RodioAudioPlayer {
       sink.pause();
       sink.append(source);
 
-      // Commit the state transition under the lock.
       let mut inner = lock_inner(&self.inner);
 
-      // Re-check after I/O — another thread may have changed the state.
+      if inner.load_generation != load_generation {
+         return Err(Error::InvalidState("Prepare request was canceled".into()));
+      }
+
       transitions::prepare(&mut inner.state, src, meta, duration)?;
 
       Self::stop_monitor(&inner);
 
-      // Apply current user settings to the new sink.
       sink.set_volume(effective_volume(&inner.state));
       sink.set_speed(inner.state.playback_rate as f32);
 
@@ -287,11 +300,10 @@ impl RodioAudioPlayer {
          let mut inner = lock_inner(&self.inner);
 
          transitions::stop(&mut inner.state)?;
+         inner.load_generation = inner.load_generation.wrapping_add(1);
 
          Self::stop_monitor(&inner);
 
-         // Clear the sink's queue before dropping so Sink::drop returns
-         // immediately instead of blocking until the audio drains.
          if let Some(ctx) = inner.playback.take() {
             ctx.sink.stop();
          }
@@ -683,7 +695,11 @@ fn descriptor_http_agent() -> ureq::Agent {
 }
 
 fn stream_http_agent() -> ureq::Agent {
-   ureq::AgentBuilder::new().redirects(0).build()
+   ureq::AgentBuilder::new()
+      .timeout_connect(HTTP_TIMEOUT)
+      .timeout_read(HTTP_TIMEOUT)
+      .redirects(0)
+      .build()
 }
 
 fn parse_byte_len(resp: &ureq::Response) -> Option<u64> {
