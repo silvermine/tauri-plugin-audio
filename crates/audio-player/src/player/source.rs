@@ -4,6 +4,7 @@ use std::time::Duration;
 use rodio::{Sample, Source};
 
 use super::http::{RemoteSourceDescriptor, fetch_remote_source_descriptor};
+use super::stretch::StretchSource;
 use super::symphonia::SymphoniaSource;
 
 use crate::error::{Error, Result};
@@ -15,7 +16,13 @@ pub(crate) enum SourceDescriptor {
    Remote(RemoteSourceDescriptor),
 }
 
-type BoxedSource = Box<dyn Source<Item = Sample> + Send>;
+pub(crate) type BoxedSource = Box<dyn Source<Item = Sample> + Send>;
+
+pub(crate) struct OpenedSource {
+   pub(crate) source: BoxedSource,
+   pub(crate) duration: Option<Duration>,
+   pub(crate) supports_direct_seek: bool,
+}
 
 pub(crate) fn load_source_descriptor(src: &str) -> Result<SourceDescriptor> {
    if src.starts_with("http://") || src.starts_with("https://") {
@@ -34,21 +41,35 @@ pub(crate) fn load_source_descriptor(src: &str) -> Result<SourceDescriptor> {
    })
 }
 
-pub(crate) fn open_source(source: &SourceDescriptor) -> Result<BoxedSource> {
-   open_source_at(source, 0.0)
-}
-
-pub(crate) fn open_source_at(source: &SourceDescriptor, position: f64) -> Result<BoxedSource> {
-   match source {
-      SourceDescriptor::Local { path } => Ok(Box::new(SymphoniaSource::new_local(
+pub(crate) fn open_source_at(
+   source: &SourceDescriptor,
+   position: f64,
+   playback_rate: f64,
+) -> Result<OpenedSource> {
+   let supports_direct_seek = matches!(source, SourceDescriptor::Local { .. })
+      && (playback_rate - 1.0).abs() <= f64::EPSILON;
+   let decoded_source: BoxedSource = match source {
+      SourceDescriptor::Local { path } => Box::new(SymphoniaSource::new_local(
          path,
          Duration::from_secs_f64(position.max(0.0)),
-      )?)),
-      SourceDescriptor::Remote(remote) => Ok(Box::new(SymphoniaSource::new_remote(
+      )?),
+      SourceDescriptor::Remote(remote) => Box::new(SymphoniaSource::new_remote(
          remote,
          Duration::from_secs_f64(position.max(0.0)),
-      )?)),
-   }
+      )?),
+   };
+   let duration = decoded_source.total_duration();
+   let source = if (playback_rate - 1.0).abs() > f64::EPSILON {
+      Box::new(StretchSource::new(decoded_source, playback_rate)) as BoxedSource
+   } else {
+      decoded_source
+   };
+
+   Ok(OpenedSource {
+      source,
+      duration,
+      supports_direct_seek,
+   })
 }
 
 pub(crate) fn infer_hint(src: &str) -> Option<String> {

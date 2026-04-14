@@ -1,5 +1,6 @@
 mod http;
 mod source;
+mod stretch;
 mod symphonia;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,10 +8,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
-use rodio::Player;
+use rodio::{Player, Sample, Source};
 use tracing::warn;
 
-use self::source::{SourceDescriptor, load_source_descriptor, open_source, open_source_at};
+use self::source::{SourceDescriptor, load_source_descriptor, open_source_at};
 
 use crate::error::{Error, Result};
 use crate::models::{AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerState, TimeUpdate};
@@ -41,6 +42,13 @@ struct PlaybackContext {
    source: SourceDescriptor,
    duration: f64,
    position_offset: f64,
+   supports_direct_seek: bool,
+}
+
+struct OpenedPlaybackSource {
+   source: Box<dyn Source<Item = Sample> + Send>,
+   duration: f64,
+   supports_direct_seek: bool,
 }
 
 impl RodioAudioPlayer {
@@ -107,19 +115,20 @@ impl RodioAudioPlayer {
    ) -> Result<AudioActionResponse> {
       let meta = metadata.unwrap_or_default();
 
-      let load_generation = {
+      let (load_generation, playback_rate) = {
          let mut inner = lock_inner(&self.inner);
          transitions::begin_load(&mut inner.state, src, &meta)?;
          inner.load_generation = inner.load_generation.wrapping_add(1);
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let load_generation = inner.load_generation;
+         let playback_rate = inner.state.playback_rate;
          let snapshot = inner.state.clone();
          drop(inner);
          (self.on_changed)(&snapshot);
-         load_generation
+         (load_generation, playback_rate)
       };
 
-      let result = self.prepare_inner(src, &meta, load_generation);
+      let result = self.prepare_inner(src, &meta, load_generation, playback_rate);
 
       match result {
          Ok(snapshot) => {
@@ -149,19 +158,17 @@ impl RodioAudioPlayer {
       src: &str,
       meta: &AudioMetadata,
       load_generation: u64,
+      playback_rate: f64,
    ) -> Result<PlayerState> {
       let descriptor = load_source_descriptor(src)?;
-      let source = open_source(&descriptor)?;
-      let duration = source
-         .total_duration()
-         .map(|d| d.as_secs_f64())
-         .unwrap_or(0.0);
+      let opened_source = open_playback_source(&descriptor, 0.0, playback_rate)?;
+      let duration = opened_source.duration;
 
       // Create a new sink, append the decoded source, and pause immediately
       // so playback waits for an explicit play() call.
       let sink = Player::connect_new(self.output_sink.mixer());
       sink.pause();
-      sink.append(source);
+      sink.append(opened_source.source);
 
       let mut inner = lock_inner(&self.inner);
 
@@ -174,13 +181,13 @@ impl RodioAudioPlayer {
       Self::stop_monitor(&inner);
 
       sink.set_volume(effective_volume(&inner.state));
-      sink.set_speed(inner.state.playback_rate as f32);
 
       inner.playback = Some(PlaybackContext {
          sink,
          source: descriptor,
          duration,
          position_offset: 0.0,
+         supports_direct_seek: opened_source.supports_direct_seek,
       });
 
       Ok(inner.state.clone())
@@ -191,15 +198,17 @@ impl RodioAudioPlayer {
          let mut inner = lock_inner(&self.inner);
          let is_ended = inner.state.status == PlaybackStatus::Ended;
          let mut replayed_from_start = false;
+         let playback_rate = inner.state.playback_rate;
 
          if is_ended
             && let Some(ctx) = &mut inner.playback
             && ctx.sink.empty()
          {
-            let source = open_source(&ctx.source)?;
-            ctx.sink.append(source);
+            let opened_source = open_playback_source(&ctx.source, 0.0, playback_rate)?;
+            ctx.sink.append(opened_source.source);
             ctx.sink.pause();
             ctx.position_offset = 0.0;
+            ctx.supports_direct_seek = opened_source.supports_direct_seek;
             replayed_from_start = true;
          }
 
@@ -281,34 +290,26 @@ impl RodioAudioPlayer {
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let seek_generation = inner.seek_generation;
 
-         let action = if let Some((source_descriptor, duration)) = inner
+         let action = if let Some((source_descriptor, duration, supports_direct_seek)) = inner
             .playback
             .as_ref()
-            .map(|ctx| (ctx.source.clone(), ctx.duration))
+            .map(|ctx| (ctx.source.clone(), ctx.duration, ctx.supports_direct_seek))
          {
-            match &source_descriptor {
-               SourceDescriptor::Remote(_) => {
-                  Self::stop_monitor(&inner);
-                  if let Some(ctx) = &inner.playback {
-                     ctx.sink.pause();
-                  }
-
-                  SeekAction::Remote {
-                     source_descriptor,
-                     duration,
-                     target_time: inner.state.current_time,
-                     previous_time,
-                     seek_generation,
-                  }
+            if supports_direct_seek {
+               Self::seek_local_playback(&mut inner, &source_descriptor, was_ended, previous_time)?;
+               SeekAction::Complete(inner.state.clone())
+            } else {
+               Self::stop_monitor(&inner);
+               if let Some(ctx) = &inner.playback {
+                  ctx.sink.pause();
                }
-               SourceDescriptor::Local { .. } => {
-                  Self::seek_local_playback(
-                     &mut inner,
-                     &source_descriptor,
-                     was_ended,
-                     previous_time,
-                  )?;
-                  SeekAction::Complete(inner.state.clone())
+
+               SeekAction::Remote {
+                  source_descriptor,
+                  duration,
+                  target_time: inner.state.current_time,
+                  previous_time,
+                  seek_generation,
                }
             }
          } else {
@@ -349,9 +350,10 @@ impl RodioAudioPlayer {
       previous_time: f64,
       seek_generation: u64,
    ) -> Result<PlayerState> {
-      let source = open_source_at(&source_descriptor, target_time);
+      let playback_rate = lock_inner(&self.inner).state.playback_rate;
+      let source = open_playback_source(&source_descriptor, target_time, playback_rate);
 
-      let source = match source {
+      let opened_source = match source {
          Ok(source) => source,
          Err(error) => {
             let mut inner = lock_inner(&self.inner);
@@ -377,7 +379,7 @@ impl RodioAudioPlayer {
 
       let sink = Player::connect_new(self.output_sink.mixer());
       sink.pause();
-      sink.append(source);
+      sink.append(opened_source.source);
 
       let mut inner = lock_inner(&self.inner);
 
@@ -387,13 +389,13 @@ impl RodioAudioPlayer {
       }
 
       sink.set_volume(effective_volume(&inner.state));
-      sink.set_speed(inner.state.playback_rate as f32);
 
       if let Some(previous_playback) = inner.playback.replace(PlaybackContext {
          sink,
          source: source_descriptor,
          duration,
          position_offset: target_time,
+         supports_direct_seek: opened_source.supports_direct_seek,
       }) {
          previous_playback.sink.stop();
       }
@@ -415,21 +417,23 @@ impl RodioAudioPlayer {
       previous_time: f64,
    ) -> Result<()> {
       let target_time = inner.state.current_time;
+      let playback_rate = inner.state.playback_rate;
       let Some(ctx) = &mut inner.playback else {
          unreachable!("Playback context disappeared during local seek");
       };
       let mut reopened_source = false;
 
       if was_ended && ctx.sink.empty() {
-         let source = match open_source(source_descriptor) {
+         let opened_source = match open_playback_source(source_descriptor, 0.0, playback_rate) {
             Ok(source) => source,
             Err(error) => {
                inner.state.current_time = previous_time;
                return Err(error);
             }
          };
-         ctx.sink.append(source);
+         ctx.sink.append(opened_source.source);
          ctx.sink.pause();
+         ctx.supports_direct_seek = opened_source.supports_direct_seek;
          reopened_source = true;
       }
 
@@ -594,11 +598,13 @@ fn monitor_loop(
       if is_empty {
          if guard.state.looping {
             // Re-append source for seamless (best-effort) loop.
+            let playback_rate = guard.state.playback_rate;
             if let Some(ctx) = &mut guard.playback {
-               match open_source(&ctx.source) {
+               match open_playback_source(&ctx.source, 0.0, playback_rate) {
                   Ok(source) => {
-                     ctx.sink.append(source);
+                     ctx.sink.append(source.source);
                      ctx.position_offset = 0.0;
+                     ctx.supports_direct_seek = source.supports_direct_seek;
                   }
                   Err(e) => warn!("Failed to reopen loop source: {e}"),
                }
@@ -639,6 +645,24 @@ fn monitor_loop(
 /// is a glitched playback state — far better than crashing the host application.
 fn lock_inner(mutex: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn open_playback_source(
+   source_descriptor: &SourceDescriptor,
+   position: f64,
+   playback_rate: f64,
+) -> Result<OpenedPlaybackSource> {
+   let opened_source = open_source_at(source_descriptor, position, playback_rate)?;
+   let duration = opened_source
+      .duration
+      .map(|value| value.as_secs_f64())
+      .unwrap_or(0.0);
+
+   Ok(OpenedPlaybackSource {
+      source: opened_source.source,
+      duration,
+      supports_direct_seek: opened_source.supports_direct_seek,
+   })
 }
 
 /// Resolves the effective sink volume, accounting for the mute flag.
