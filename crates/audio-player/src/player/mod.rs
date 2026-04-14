@@ -192,14 +192,13 @@ impl RodioAudioPlayer {
          let is_ended = inner.state.status == PlaybackStatus::Ended;
          let mut replayed_from_start = false;
 
-         // Re-append source for replay from Ended before the transition
-         // mutates status.
          if is_ended
             && let Some(ctx) = &mut inner.playback
             && ctx.sink.empty()
          {
             let source = open_source(&ctx.source)?;
             ctx.sink.append(source);
+            ctx.sink.pause();
             ctx.position_offset = 0.0;
             replayed_from_start = true;
          }
@@ -326,7 +325,7 @@ impl RodioAudioPlayer {
                seek_generation,
             } => {
                drop(inner);
-               self.seek_remote_playback(
+               self.reopen_playback(
                   source_descriptor,
                   duration,
                   target_time,
@@ -342,7 +341,7 @@ impl RodioAudioPlayer {
       Ok(AudioActionResponse::new(snapshot, expected))
    }
 
-   fn seek_remote_playback(
+   fn reopen_playback(
       &self,
       source_descriptor: SourceDescriptor,
       duration: f64,
@@ -415,7 +414,8 @@ impl RodioAudioPlayer {
       was_ended: bool,
       previous_time: f64,
    ) -> Result<()> {
-      let Some(ctx) = &inner.playback else {
+      let target_time = inner.state.current_time;
+      let Some(ctx) = &mut inner.playback else {
          unreachable!("Playback context disappeared during local seek");
       };
       let mut reopened_source = false;
@@ -443,6 +443,8 @@ impl RodioAudioPlayer {
          inner.state.current_time = previous_time;
          return Err(Error::Audio(format!("Failed to seek audio: {e}")));
       }
+
+      ctx.position_offset = target_time;
 
       Ok(())
    }
@@ -476,13 +478,63 @@ impl RodioAudioPlayer {
    }
 
    pub fn set_playback_rate(&self, rate: f64) -> Result<PlayerState> {
-      let snapshot = {
+      enum PlaybackRateAction {
+         Complete(PlayerState),
+         Reopen {
+            source_descriptor: SourceDescriptor,
+            duration: f64,
+            target_time: f64,
+            previous_time: f64,
+            seek_generation: u64,
+         },
+      }
+
+      let action = {
          let mut inner = lock_inner(&self.inner);
+         let previous_time = inner.state.current_time;
+
          transitions::set_playback_rate(&mut inner.state, rate)?;
-         if let Some(ctx) = &inner.playback {
-            ctx.sink.set_speed(inner.state.playback_rate as f32);
+
+         if let Some((source_descriptor, duration)) = inner
+            .playback
+            .as_ref()
+            .map(|ctx| (ctx.source.clone(), ctx.duration))
+         {
+            inner.seek_generation = inner.seek_generation.wrapping_add(1);
+            let seek_generation = inner.seek_generation;
+
+            Self::stop_monitor(&inner);
+            if let Some(ctx) = &inner.playback {
+               ctx.sink.pause();
+            }
+
+            PlaybackRateAction::Reopen {
+               source_descriptor,
+               duration,
+               target_time: inner.state.current_time,
+               previous_time,
+               seek_generation,
+            }
+         } else {
+            PlaybackRateAction::Complete(inner.state.clone())
          }
-         inner.state.clone()
+      };
+
+      let snapshot = match action {
+         PlaybackRateAction::Complete(snapshot) => snapshot,
+         PlaybackRateAction::Reopen {
+            source_descriptor,
+            duration,
+            target_time,
+            previous_time,
+            seek_generation,
+         } => self.reopen_playback(
+            source_descriptor,
+            duration,
+            target_time,
+            previous_time,
+            seek_generation,
+         )?,
       };
 
       (self.on_changed)(&snapshot);
@@ -533,7 +585,7 @@ fn monitor_loop(
 
       let (pos, duration, is_empty) = match &guard.playback {
          Some(ctx) => {
-            let pos = ctx.position_offset + ctx.sink.get_pos().as_secs_f64();
+            let pos = ctx.position_offset + (ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate);
             (pos, ctx.duration, ctx.sink.empty())
          }
          None => break,
