@@ -416,7 +416,6 @@ impl RodioAudioPlayer {
       was_ended: bool,
       previous_time: f64,
    ) -> Result<()> {
-      let target_time = inner.state.current_time;
       let playback_rate = inner.state.playback_rate;
       let Some(ctx) = &mut inner.playback else {
          unreachable!("Playback context disappeared during local seek");
@@ -448,7 +447,7 @@ impl RodioAudioPlayer {
          return Err(Error::Audio(format!("Failed to seek audio: {e}")));
       }
 
-      ctx.position_offset = target_time;
+      ctx.position_offset = 0.0;
 
       Ok(())
    }
