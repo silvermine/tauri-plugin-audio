@@ -108,7 +108,7 @@ impl RodioAudioPlayer {
       lock_inner(&self.inner).state.clone()
    }
 
-   pub fn prepare(
+   pub fn load(
       &self,
       src: &str,
       metadata: Option<AudioMetadata>,
@@ -128,7 +128,7 @@ impl RodioAudioPlayer {
          (load_generation, playback_rate)
       };
 
-      let result = self.prepare_inner(src, &meta, load_generation, playback_rate);
+      let result = self.load_inner(src, &meta, load_generation, playback_rate);
 
       match result {
          Ok(snapshot) => {
@@ -139,7 +139,7 @@ impl RodioAudioPlayer {
             let mut inner = lock_inner(&self.inner);
 
             if inner.load_generation != load_generation {
-               return Err(Error::InvalidState("Prepare request was canceled".into()));
+               return Err(Error::InvalidState("Load request was canceled".into()));
             }
 
             transitions::error(&mut inner.state, e.to_string());
@@ -153,7 +153,7 @@ impl RodioAudioPlayer {
 
    /// Inner prepare logic that may fail. Separated so `prepare()` can catch errors
    /// and transition to the Error state before propagating.
-   fn prepare_inner(
+   fn load_inner(
       &self,
       src: &str,
       meta: &AudioMetadata,
@@ -173,10 +173,10 @@ impl RodioAudioPlayer {
       let mut inner = lock_inner(&self.inner);
 
       if inner.load_generation != load_generation {
-         return Err(Error::InvalidState("Prepare request was canceled".into()));
+         return Err(Error::InvalidState("Load request was canceled".into()));
       }
 
-      transitions::prepare(&mut inner.state, src, meta, duration)?;
+      transitions::load(&mut inner.state, src, meta, duration)?;
 
       Self::stop_monitor(&inner);
 

@@ -20,7 +20,7 @@ pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> R
       PlaybackStatus::Idle | PlaybackStatus::Ended | PlaybackStatus::Error => {}
       _ => {
          return Err(Error::InvalidState(format!(
-            "Cannot prepare in {:?} state",
+            "Cannot load in {:?} state",
             state.status
          )));
       }
@@ -39,7 +39,7 @@ pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> R
 
 /// Finalizes prepare by transitioning from `Loading` to `Ready` with the
 /// decoded duration.
-pub fn prepare(
+pub fn load(
    state: &mut PlayerState,
    src: &str,
    meta: &AudioMetadata,
@@ -49,7 +49,7 @@ pub fn prepare(
       PlaybackStatus::Loading => {}
       _ => {
          return Err(Error::InvalidState(format!(
-            "Cannot prepare in {:?} state",
+            "Cannot load in {:?} state",
             state.status
          )));
       }
@@ -280,9 +280,9 @@ mod tests {
    // -- prepare (finalize) --
 
    #[test]
-   fn prepare_from_loading() {
+   fn load_from_loading() {
       let mut s = state_with_status(PlaybackStatus::Loading);
-      prepare(&mut s, "test.mp3", &meta("Song"), 120.0).unwrap();
+      load(&mut s, "test.mp3", &meta("Song"), 120.0).unwrap();
 
       assert_eq!(s.status, PlaybackStatus::Ready);
       assert_eq!(s.src.as_deref(), Some("test.mp3"));
@@ -293,39 +293,39 @@ mod tests {
    }
 
    #[test]
-   fn prepare_rejected_from_idle() {
+   fn load_rejected_from_idle() {
       let mut s = state_with_status(PlaybackStatus::Idle);
-      assert!(prepare(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
-   fn prepare_rejected_from_ended() {
+   fn load_rejected_from_ended() {
       let mut s = state_with_status(PlaybackStatus::Ended);
-      assert!(prepare(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
-   fn prepare_rejected_from_error() {
+   fn load_rejected_from_error() {
       let mut s = state_with_status(PlaybackStatus::Error);
-      assert!(prepare(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
-   fn prepare_rejected_from_ready() {
+   fn load_rejected_from_ready() {
       let mut s = state_with_status(PlaybackStatus::Ready);
-      assert!(prepare(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
-   fn prepare_rejected_from_playing() {
+   fn load_rejected_from_playing() {
       let mut s = state_with_status(PlaybackStatus::Playing);
-      assert!(prepare(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
-   fn prepare_rejected_from_paused() {
+   fn load_rejected_from_paused() {
       let mut s = state_with_status(PlaybackStatus::Paused);
-      assert!(prepare(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    // -- play --
@@ -681,7 +681,7 @@ mod tests {
       assert_eq!(s.status, before.status);
 
       let mut s = state_with_status(PlaybackStatus::Playing);
-      let _ = prepare(&mut s, "a.mp3", &AudioMetadata::default(), 0.0);
+      let _ = load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0);
       assert_eq!(s.status, PlaybackStatus::Playing);
    }
 }

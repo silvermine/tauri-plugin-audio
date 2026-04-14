@@ -32,7 +32,7 @@ impl<R: Runtime, T: Manager<R>> AudioExt<R> for T {
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
    Builder::new("audio")
       .invoke_handler(tauri::generate_handler![
-         commands::prepare,
+         commands::load,
          commands::play,
          commands::pause,
          commands::stop,

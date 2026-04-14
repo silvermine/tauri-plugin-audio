@@ -68,7 +68,7 @@ beforeEach(() => {
       if (cmd === 'plugin:audio|get_state') {
          return IDLE_STATE;
       }
-      if (cmd === 'plugin:audio|prepare') {
+      if (cmd === 'plugin:audio|load') {
          return {
             ...ACTION_RESPONSE_BASE,
             expectedStatus: PlaybackStatus.Ready,
@@ -130,23 +130,23 @@ describe('getPlayer', () => {
 
       expect(lastCmd).toBe('plugin:audio|get_state');
       expect(player.status).toBe(PlaybackStatus.Idle);
-      expect(hasAction(player, AudioAction.Prepare)).toBe(true);
+      expect(hasAction(player, AudioAction.Load)).toBe(true);
    });
 });
 
 describe('transport actions', () => {
-   it('prepare — sends src and metadata, returns Ready player', async () => {
+   it('load — sends src and metadata, returns Ready player', async () => {
       const player = await getPlayer();
 
-      if (!hasAction(player, AudioAction.Prepare)) {
-         throw new Error('expected prepare action');
+      if (!hasAction(player, AudioAction.Load)) {
+         throw new Error('expected load action');
       }
-      const response = await player.prepare('https://example.com/song.mp3', {
+      const response = await player.load('https://example.com/song.mp3', {
          title: 'Test Song',
          artist: 'Test Artist',
       });
 
-      expect(lastCmd).toBe('plugin:audio|prepare');
+      expect(lastCmd).toBe('plugin:audio|load');
       expect(lastArgs.src).toBe('https://example.com/song.mp3');
       expect((lastArgs.metadata as Record<string, unknown>).title).toBe('Test Song');
       expect(response.isExpectedStatus).toBe(true);
@@ -213,10 +213,10 @@ describe('transport actions', () => {
          return attachPlayer(IDLE_STATE);
       });
 
-      if (!hasAction(player, AudioAction.Prepare)) {
-         throw new Error('expected prepare action');
+      if (!hasAction(player, AudioAction.Load)) {
+         throw new Error('expected load action');
       }
-      await expect(player.prepare('test.mp3')).rejects.toThrow('audio error');
+      await expect(player.load('test.mp3')).rejects.toThrow('audio error');
    });
 });
 
@@ -285,10 +285,10 @@ describe('player controls (always available)', () => {
 });
 
 describe('state machine — action availability', () => {
-   it('Idle: only prepare is available', () => {
+   it('Idle: only load is available', () => {
       const player = attachPlayer(IDLE_STATE);
 
-      expect(hasAction(player, AudioAction.Prepare)).toBe(true);
+      expect(hasAction(player, AudioAction.Load)).toBe(true);
       expect(hasAction(player, AudioAction.Play)).toBe(false);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
       expect(hasAction(player, AudioAction.Stop)).toBe(false);
@@ -299,7 +299,7 @@ describe('state machine — action availability', () => {
       const player = attachPlayer({ ...IDLE_STATE, status: PlaybackStatus.Loading });
 
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
-      expect(hasAction(player, AudioAction.Prepare)).toBe(false);
+      expect(hasAction(player, AudioAction.Load)).toBe(false);
       expect(hasAction(player, AudioAction.Play)).toBe(false);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
    });
@@ -311,7 +311,7 @@ describe('state machine — action availability', () => {
       expect(hasAction(player, AudioAction.Seek)).toBe(true);
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
-      expect(hasAction(player, AudioAction.Prepare)).toBe(false);
+      expect(hasAction(player, AudioAction.Load)).toBe(false);
    });
 
    it('Playing: pause, seek, and stop are available', () => {
@@ -321,7 +321,7 @@ describe('state machine — action availability', () => {
       expect(hasAction(player, AudioAction.Seek)).toBe(true);
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
       expect(hasAction(player, AudioAction.Play)).toBe(false);
-      expect(hasAction(player, AudioAction.Prepare)).toBe(false);
+      expect(hasAction(player, AudioAction.Load)).toBe(false);
    });
 
    it('Paused: play, seek, and stop are available', () => {
@@ -331,23 +331,23 @@ describe('state machine — action availability', () => {
       expect(hasAction(player, AudioAction.Seek)).toBe(true);
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
-      expect(hasAction(player, AudioAction.Prepare)).toBe(false);
+      expect(hasAction(player, AudioAction.Load)).toBe(false);
    });
 
-   it('Ended: play, seek, prepare, and stop are available', () => {
+   it('Ended: play, seek, load, and stop are available', () => {
       const player = attachPlayer(ENDED_STATE);
 
       expect(hasAction(player, AudioAction.Play)).toBe(true);
       expect(hasAction(player, AudioAction.Seek)).toBe(true);
-      expect(hasAction(player, AudioAction.Prepare)).toBe(true);
+      expect(hasAction(player, AudioAction.Load)).toBe(true);
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
    });
 
-   it('Error: only prepare is available', () => {
+   it('Error: only load is available', () => {
       const player = attachPlayer({ ...IDLE_STATE, status: PlaybackStatus.Error, error: 'fail' });
 
-      expect(hasAction(player, AudioAction.Prepare)).toBe(true);
+      expect(hasAction(player, AudioAction.Load)).toBe(true);
       expect(hasAction(player, AudioAction.Play)).toBe(false);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
       expect(hasAction(player, AudioAction.Stop)).toBe(false);
@@ -367,7 +367,7 @@ describe('state machine — action availability', () => {
    it('attaches only the allowed transport methods as callable functions', () => {
       const idle = attachPlayer(IDLE_STATE);
 
-      expect(typeof (idle as unknown as Record<string, unknown>).prepare).toBe('function');
+      expect(typeof (idle as unknown as Record<string, unknown>).load).toBe('function');
       expect(typeof (idle as unknown as Record<string, unknown>).play).toBe('undefined');
       expect(typeof (idle as unknown as Record<string, unknown>).pause).toBe('undefined');
    });

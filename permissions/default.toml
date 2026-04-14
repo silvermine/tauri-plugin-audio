@@ -1,7 +1,7 @@
 [default]
 description = "Default permissions for the plugin"
 permissions = [
-   "allow-prepare",
+   "allow-load",
    "allow-play",
    "allow-pause",
    "allow-stop",

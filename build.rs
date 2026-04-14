@@ -1,5 +1,5 @@
 const COMMANDS: &[&str] = &[
-   "prepare",
+   "load",
    "play",
    "pause",
    "stop",

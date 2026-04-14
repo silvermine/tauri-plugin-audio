@@ -355,7 +355,7 @@ const isPlaying = computed(() => player.value?.status === PlaybackStatus.Playing
 
 const canLoad = computed(() => {
    return player.value
-      && (hasAction(player.value, AudioAction.Prepare) || hasAction(player.value, AudioAction.Stop))
+      && (hasAction(player.value, AudioAction.Load) || hasAction(player.value, AudioAction.Stop))
       && sourceUrl.value.length > 0;
 });
 
@@ -431,7 +431,7 @@ async function loadTrack(): Promise<void> {
          player.value = stopResp.player;
       }
 
-      if (!hasAction(player.value, AudioAction.Prepare)) {
+      if (!hasAction(player.value, AudioAction.Load)) {
          return;
       }
 
@@ -440,7 +440,7 @@ async function loadTrack(): Promise<void> {
          title: isSample ? SAMPLE_TRACK.title : sourceUrl.value.split('/').pop() || 'Unknown Track',
          ...(isSample && { artwork: SAMPLE_TRACK.artwork }),
       };
-      const resp = await player.value.prepare(sourceUrl.value, metadata);
+      const resp = await player.value.load(sourceUrl.value, metadata);
 
       player.value = resp.player;
       duration.value = resp.player.duration;
@@ -577,10 +577,10 @@ onMounted(async () => {
    });
 
    // Preload sample track
-   if (hasAction(p, AudioAction.Prepare)) {
+   if (hasAction(p, AudioAction.Load)) {
       try {
          isLoading.value = true;
-         const resp = await p.prepare(SAMPLE_TRACK.src, {
+         const resp = await p.load(SAMPLE_TRACK.src, {
             title: SAMPLE_TRACK.title,
             artwork: SAMPLE_TRACK.artwork,
          });

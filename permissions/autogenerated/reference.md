@@ -4,7 +4,7 @@ Default permissions for the plugin
 
 #### This default permission set includes the following:
 
-- `allow-prepare`
+- `allow-load`
 - `allow-play`
 - `allow-pause`
 - `allow-stop`
@@ -80,6 +80,32 @@ Denies the is_native command without any pre-configured scope.
 <tr>
 <td>
 
+`audio:allow-load`
+
+</td>
+<td>
+
+Enables the load command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`audio:deny-load`
+
+</td>
+<td>
+
+Denies the load command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `audio:allow-pause`
 
 </td>
@@ -125,32 +151,6 @@ Enables the play command without any pre-configured scope.
 <td>
 
 Denies the play command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`audio:allow-prepare`
-
-</td>
-<td>
-
-Enables the prepare command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`audio:deny-prepare`
-
-</td>
-<td>
-
-Denies the prepare command without any pre-configured scope.
 
 </td>
 </tr>

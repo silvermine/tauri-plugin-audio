@@ -135,8 +135,8 @@ async function sendSetting(
 }
 
 const transportActions = {
-   async prepare(src: string, metadata?: AudioMetadata) {
-      return sendAction(AudioAction.Prepare, { src, metadata });
+   async load(src: string, metadata?: AudioMetadata) {
+      return sendAction(AudioAction.Load, { src, metadata });
    },
 
    async play() {

@@ -319,6 +319,18 @@
           "markdownDescription": "Denies the is_native command without any pre-configured scope."
         },
         {
+          "description": "Enables the load command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-load",
+          "markdownDescription": "Enables the load command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the load command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-load",
+          "markdownDescription": "Denies the load command without any pre-configured scope."
+        },
+        {
           "description": "Enables the pause command without any pre-configured scope.",
           "type": "string",
           "const": "allow-pause",
@@ -341,18 +353,6 @@
           "type": "string",
           "const": "deny-play",
           "markdownDescription": "Denies the play command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the prepare command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-prepare",
-          "markdownDescription": "Enables the prepare command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the prepare command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-prepare",
-          "markdownDescription": "Denies the prepare command without any pre-configured scope."
         },
         {
           "description": "Enables the seek command without any pre-configured scope.",
@@ -427,10 +427,10 @@
           "markdownDescription": "Denies the stop command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-prepare`\n- `allow-play`\n- `allow-pause`\n- `allow-stop`\n- `allow-seek`\n- `allow-set-volume`\n- `allow-set-muted`\n- `allow-set-playback-rate`\n- `allow-set-loop`\n- `allow-get-state`\n- `allow-is-native`",
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-play`\n- `allow-pause`\n- `allow-stop`\n- `allow-seek`\n- `allow-set-volume`\n- `allow-set-muted`\n- `allow-set-playback-rate`\n- `allow-set-loop`\n- `allow-get-state`\n- `allow-is-native`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-prepare`\n- `allow-play`\n- `allow-pause`\n- `allow-stop`\n- `allow-seek`\n- `allow-set-volume`\n- `allow-set-muted`\n- `allow-set-playback-rate`\n- `allow-set-loop`\n- `allow-get-state`\n- `allow-is-native`"
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-load`\n- `allow-play`\n- `allow-pause`\n- `allow-stop`\n- `allow-seek`\n- `allow-set-volume`\n- `allow-set-muted`\n- `allow-set-playback-rate`\n- `allow-set-loop`\n- `allow-get-state`\n- `allow-is-native`"
         }
       ]
     }

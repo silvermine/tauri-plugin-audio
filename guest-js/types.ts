@@ -52,7 +52,7 @@ export enum PlaybackStatus {
  * attached to the {@link Player} object.
  */
 export enum AudioAction {
-   Prepare = 'prepare',
+   Load = 'load',
    Play = 'play',
    Pause = 'pause',
    Stop = 'stop',
@@ -91,7 +91,7 @@ export interface PlayerState<S extends PlaybackStatus> {
 }
 
 /**
- * Response from a transport action (prepare, play, pause, stop, seek).
+ * Response from a transport action (load, play, pause, stop, seek).
  *
  * Wraps the resulting player state with status-expectation metadata so callers
  * can detect unexpected state transitions.
@@ -109,14 +109,14 @@ export interface AudioActionResponse<A extends AudioAction = AudioAction> {
 export interface AllAudioActions {
 
    /**
-    * Prepare an audio source.
+    * Load an audio source.
     *
     * @param src - URL or file path of the audio source.
     * @param metadata - Optional metadata for OS transport
     *   controls (title, artist, artwork).
     * @returns The action response with the updated player state.
     */
-   [AudioAction.Prepare]: (src: string, metadata?: AudioMetadata) => Promise<AudioActionResponse<AudioAction.Prepare>>;
+   [AudioAction.Load]: (src: string, metadata?: AudioMetadata) => Promise<AudioActionResponse<AudioAction.Load>>;
 
    /** Start or resume playback. */
    [AudioAction.Play]: () => Promise<AudioActionResponse<AudioAction.Play>>;
@@ -233,7 +233,7 @@ export interface PlayerControls {
 // Only these transport actions are allowed for each given PlaybackStatus:
 export const allowedActions = {
    [PlaybackStatus.Idle]: [
-      AudioAction.Prepare,
+      AudioAction.Load,
    ],
    [PlaybackStatus.Loading]: [
       AudioAction.Stop,
@@ -256,16 +256,16 @@ export const allowedActions = {
    [PlaybackStatus.Ended]: [
       AudioAction.Play,
       AudioAction.Seek,
-      AudioAction.Prepare,
+      AudioAction.Load,
       AudioAction.Stop,
    ],
    [PlaybackStatus.Error]: [
-      AudioAction.Prepare,
+      AudioAction.Load,
    ],
 } as const satisfies Record<PlaybackStatus, AudioAction[] | []>;
 
 export const expectedStatusesForAction = {
-   [AudioAction.Prepare]: [ PlaybackStatus.Ready ],
+   [AudioAction.Load]: [ PlaybackStatus.Ready ],
    [AudioAction.Play]: [ PlaybackStatus.Playing ],
    [AudioAction.Pause]: [ PlaybackStatus.Paused ],
    [AudioAction.Stop]: [ PlaybackStatus.Idle ],
