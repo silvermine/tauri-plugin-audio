@@ -1,5 +1,4 @@
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use symphonia::core::io::MediaSource;
@@ -28,7 +27,7 @@ pub(crate) struct HttpAudioReader {
 }
 
 struct HttpResponseReader {
-   inner: Mutex<Box<dyn Read + Send>>,
+   inner: Box<dyn Read + Send + Sync>,
 }
 
 pub(crate) fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDescriptor> {
@@ -140,18 +139,14 @@ fn skip_bytes<R: Read>(reader: &mut R, mut remaining: u64) -> std::io::Result<()
 impl HttpResponseReader {
    fn new(response: ureq::Response) -> Self {
       Self {
-         inner: Mutex::new(Box::new(response.into_reader())),
+         inner: response.into_reader(),
       }
    }
 }
 
 impl Read for HttpResponseReader {
    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-      self
-         .inner
-         .lock()
-         .unwrap_or_else(|e| e.into_inner())
-         .read(buf)
+      self.inner.read(buf)
    }
 }
 

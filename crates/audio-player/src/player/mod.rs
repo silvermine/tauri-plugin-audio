@@ -33,6 +33,7 @@ struct Inner {
    playback: Option<PlaybackContext>,
    monitor_stop: Arc<AtomicBool>,
    load_generation: u64,
+   seek_generation: u64,
 }
 
 struct PlaybackContext {
@@ -57,6 +58,7 @@ impl RodioAudioPlayer {
             playback: None,
             monitor_stop: Arc::new(AtomicBool::new(true)),
             load_generation: 0,
+            seek_generation: 0,
          })),
          output_sink,
          on_changed,
@@ -109,6 +111,7 @@ impl RodioAudioPlayer {
          let mut inner = lock_inner(&self.inner);
          transitions::begin_load(&mut inner.state, src, &meta)?;
          inner.load_generation = inner.load_generation.wrapping_add(1);
+         inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let load_generation = inner.load_generation;
          let snapshot = inner.state.clone();
          drop(inner);
@@ -243,6 +246,7 @@ impl RodioAudioPlayer {
 
          transitions::stop(&mut inner.state)?;
          inner.load_generation = inner.load_generation.wrapping_add(1);
+         inner.seek_generation = inner.seek_generation.wrapping_add(1);
 
          Self::stop_monitor(&inner);
 
@@ -258,28 +262,79 @@ impl RodioAudioPlayer {
    }
 
    pub fn seek(&self, position: f64) -> Result<AudioActionResponse> {
+      enum SeekAction {
+         Complete(PlayerState),
+         Remote {
+            source_descriptor: SourceDescriptor,
+            duration: f64,
+            target_time: f64,
+            previous_time: f64,
+            seek_generation: u64,
+         },
+      }
+
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
          let was_ended = inner.state.status == PlaybackStatus::Ended;
          let previous_time = inner.state.current_time;
 
          transitions::seek(&mut inner.state, position)?;
+         inner.seek_generation = inner.seek_generation.wrapping_add(1);
+         let seek_generation = inner.seek_generation;
 
-         if let Some((source_descriptor, duration)) = inner
+         let action = if let Some((source_descriptor, duration)) = inner
             .playback
             .as_ref()
             .map(|ctx| (ctx.source.clone(), ctx.duration))
          {
-            self.seek_playback(
-               &mut inner,
+            match &source_descriptor {
+               SourceDescriptor::Remote(_) => {
+                  Self::stop_monitor(&inner);
+                  if let Some(ctx) = &inner.playback {
+                     ctx.sink.pause();
+                  }
+
+                  SeekAction::Remote {
+                     source_descriptor,
+                     duration,
+                     target_time: inner.state.current_time,
+                     previous_time,
+                     seek_generation,
+                  }
+               }
+               SourceDescriptor::Local { .. } => {
+                  Self::seek_local_playback(
+                     &mut inner,
+                     &source_descriptor,
+                     was_ended,
+                     previous_time,
+                  )?;
+                  SeekAction::Complete(inner.state.clone())
+               }
+            }
+         } else {
+            SeekAction::Complete(inner.state.clone())
+         };
+
+         match action {
+            SeekAction::Complete(snapshot) => snapshot,
+            SeekAction::Remote {
                source_descriptor,
                duration,
-               was_ended,
+               target_time,
                previous_time,
-            )?;
+               seek_generation,
+            } => {
+               drop(inner);
+               self.seek_remote_playback(
+                  source_descriptor,
+                  duration,
+                  target_time,
+                  previous_time,
+                  seek_generation,
+               )?
+            }
          }
-
-         inner.state.clone()
       };
 
       let expected = snapshot.status;
@@ -287,50 +342,36 @@ impl RodioAudioPlayer {
       Ok(AudioActionResponse::new(snapshot, expected))
    }
 
-   fn seek_playback(
-      &self,
-      inner: &mut Inner,
-      source_descriptor: SourceDescriptor,
-      duration: f64,
-      was_ended: bool,
-      previous_time: f64,
-   ) -> Result<()> {
-      match &source_descriptor {
-         SourceDescriptor::Remote(_) => {
-            self.seek_remote_playback(inner, source_descriptor, duration, previous_time)
-         }
-         SourceDescriptor::Local { .. } => {
-            Self::seek_local_playback(inner, &source_descriptor, was_ended, previous_time)
-         }
-      }
-   }
-
    fn seek_remote_playback(
       &self,
-      inner: &mut Inner,
       source_descriptor: SourceDescriptor,
       duration: f64,
+      target_time: f64,
       previous_time: f64,
-   ) -> Result<()> {
-      let was_playing = inner.state.status == PlaybackStatus::Playing;
-      let current_volume = effective_volume(&inner.state);
-      let target_time = inner.state.current_time;
+      seek_generation: u64,
+   ) -> Result<PlayerState> {
+      let source = open_source_at(&source_descriptor, target_time);
 
-      if let Some(ctx) = &inner.playback {
-         ctx.sink.set_volume(0.0);
-         ctx.sink.pause();
-      }
-
-      let source = match open_source_at(&source_descriptor, target_time) {
+      let source = match source {
          Ok(source) => source,
          Err(error) => {
-            if let Some(ctx) = &inner.playback {
-               ctx.sink.set_volume(current_volume);
-               if was_playing {
-                  ctx.sink.play();
+            let mut inner = lock_inner(&self.inner);
+
+            if inner.seek_generation == seek_generation {
+               inner.state.current_time = previous_time;
+
+               if let Some(ctx) = &inner.playback {
+                  ctx.sink.set_volume(effective_volume(&inner.state));
+                  if inner.state.status == PlaybackStatus::Playing {
+                     ctx.sink.play();
+                  }
+               }
+
+               if inner.state.status == PlaybackStatus::Playing {
+                  self.start_monitor(&mut inner);
                }
             }
-            inner.state.current_time = previous_time;
+
             return Err(error);
          }
       };
@@ -338,7 +379,15 @@ impl RodioAudioPlayer {
       let sink = Player::connect_new(self.output_sink.mixer());
       sink.pause();
       sink.append(source);
-      sink.set_volume(current_volume);
+
+      let mut inner = lock_inner(&self.inner);
+
+      if inner.seek_generation != seek_generation {
+         sink.stop();
+         return Err(Error::InvalidState("Seek request was canceled".into()));
+      }
+
+      sink.set_volume(effective_volume(&inner.state));
       sink.set_speed(inner.state.playback_rate as f32);
 
       if let Some(previous_playback) = inner.playback.replace(PlaybackContext {
@@ -350,11 +399,14 @@ impl RodioAudioPlayer {
          previous_playback.sink.stop();
       }
 
-      if was_playing && let Some(ctx) = &inner.playback {
-         ctx.sink.play();
+      if inner.state.status == PlaybackStatus::Playing {
+         if let Some(ctx) = &inner.playback {
+            ctx.sink.play();
+         }
+         self.start_monitor(&mut inner);
       }
 
-      Ok(())
+      Ok(inner.state.clone())
    }
 
    fn seek_local_playback(
@@ -527,7 +579,6 @@ fn monitor_loop(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
 
 /// Acquires the mutex, recovering from poisoning instead of panicking.
 ///
