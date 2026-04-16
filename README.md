@@ -189,7 +189,9 @@ async function managePlayback() {
 #### Adjust settings
 
 Volume, mute, playback rate, and loop controls are always available
-regardless of playback status.
+regardless of playback status. On desktop, `setPlaybackRate` uses
+WSOLA time-stretching to change tempo without altering pitch (rate
+range 0.25–4.0).
 
 ```ts
 import { getPlayer } from '@silvermine/tauri-plugin-audio';

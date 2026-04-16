@@ -38,10 +38,12 @@
                type="range"
                class="progress-bar"
                :class="{ inactive: !canSeek }"
-               :value="currentTime"
+               :value="progressValue"
                :max="duration || 1"
                step="0.1"
+               @pointerdown="canSeek && beginSeekDrag()"
                @input="canSeek && seekTo(Number(($event.target as HTMLInputElement).value))"
+               @change="canSeek && endSeekDrag(Number(($event.target as HTMLInputElement).value))"
             />
 
             <!-- Title + time -->
@@ -201,7 +203,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue';
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
 import './style.css';
 import {
    getPlayer,
@@ -226,6 +228,8 @@ const settingsView = ref<'main' | 'speed'>('main');
 const settingsAnchorEl = ref<HTMLElement | null>(null);
 const isLoading = ref(false);
 const errorMessage = ref('');
+const seekPreviewTime = ref<number | null>(null);
+const isSeekDragging = ref(false);
 
 const speedOptions = [
    { label: '0.25x', value: 0.25 },
@@ -240,6 +244,10 @@ const speedOptions = [
 
 let unlistenState: (() => void) | null = null;
 let unlistenTime: (() => void) | null = null;
+let seekInFlight = false;
+let queuedSeekPosition: number | null = null;
+let seekEpoch = 0;
+let lastDragSeekPosition: number | null = null;
 
 const MAX_LOG_ENTRIES = 200;
 
@@ -351,6 +359,10 @@ const timeDisplay = computed(() => {
    return `${formatTime(currentTime.value)} / ${formatTime(duration.value)}`;
 });
 
+const progressValue = computed(() => {
+   return seekPreviewTime.value ?? currentTime.value;
+});
+
 const isPlaying = computed(() => player.value?.status === PlaybackStatus.Playing);
 
 const canLoad = computed(() => {
@@ -413,6 +425,87 @@ async function selectSpeed(rate: number): Promise<void> {
    settingsView.value = 'main';
 }
 
+function clampSeekPosition(position: number): number {
+   return Math.max(0, Math.min(position, duration.value || position));
+}
+
+function invalidateSeekInteraction(): void {
+   seekEpoch += 1;
+   queuedSeekPosition = null;
+   lastDragSeekPosition = null;
+   seekPreviewTime.value = null;
+   isSeekDragging.value = false;
+}
+
+async function flushQueuedSeek(): Promise<void> {
+   if (seekInFlight || queuedSeekPosition === null || !player.value || !hasAction(player.value, AudioAction.Seek)) {
+      return;
+   }
+
+   const position = queuedSeekPosition;
+   const epoch = seekEpoch;
+   queuedSeekPosition = null;
+   seekInFlight = true;
+
+   try {
+      const resp = await player.value.seek(position);
+
+      if (epoch !== seekEpoch || queuedSeekPosition !== null) {
+         return;
+      }
+
+      player.value = resp.player;
+      currentTime.value = resp.player.currentTime;
+      if (!isSeekDragging.value) {
+         seekPreviewTime.value = null;
+      }
+   } catch (e) {
+      if (epoch === seekEpoch) {
+         errorMessage.value = `${e}`;
+         if (!isSeekDragging.value) {
+            seekPreviewTime.value = null;
+         }
+      }
+   } finally {
+      seekInFlight = false;
+      if (queuedSeekPosition !== null) {
+         void flushQueuedSeek();
+      } else if (epoch === seekEpoch && !isSeekDragging.value) {
+         seekPreviewTime.value = null;
+      }
+   }
+}
+
+function queueSeek(position: number): void {
+   seekPreviewTime.value = position;
+   queuedSeekPosition = position;
+   void flushQueuedSeek();
+}
+
+function beginSeekDrag(): void {
+   isSeekDragging.value = true;
+   lastDragSeekPosition = null;
+   seekPreviewTime.value = currentTime.value;
+}
+
+function endSeekDrag(position: number): void {
+   const clamped = clampSeekPosition(position);
+   const alreadyQueuedDuringDrag = lastDragSeekPosition !== null && Math.abs(lastDragSeekPosition - clamped) < 1e-9;
+
+   isSeekDragging.value = false;
+   currentTime.value = clamped;
+   lastDragSeekPosition = null;
+
+   if (alreadyQueuedDuringDrag) {
+      if (!seekInFlight && queuedSeekPosition === null) {
+         seekPreviewTime.value = null;
+      }
+      return;
+   }
+
+   queueSeek(clamped);
+}
+
 // -- Actions --
 
 async function loadTrack(): Promise<void> {
@@ -420,6 +513,7 @@ async function loadTrack(): Promise<void> {
       return;
    }
 
+   invalidateSeekInteraction();
    isLoading.value = true;
    errorMessage.value = '';
 
@@ -474,27 +568,27 @@ async function togglePlay(): Promise<void> {
    }
 }
 
-async function seekRelative(offset: number): Promise<void> {
+function seekRelative(offset: number): void {
    if (!player.value || !hasAction(player.value, AudioAction.Seek)) {
       return;
    }
 
-   const pos = Math.max(0, currentTime.value + offset);
-   const resp = await player.value.seek(pos);
-
-   player.value = resp.player;
-   currentTime.value = resp.player.currentTime;
+   const pos = clampSeekPosition((seekPreviewTime.value ?? currentTime.value) + offset);
+   currentTime.value = pos;
+   queueSeek(pos);
 }
 
-async function seekTo(position: number): Promise<void> {
+function seekTo(position: number): void {
    if (!player.value || !hasAction(player.value, AudioAction.Seek)) {
       return;
    }
 
-   const resp = await player.value.seek(position);
-
-   player.value = resp.player;
-   currentTime.value = resp.player.currentTime;
+   const clamped = clampSeekPosition(position);
+   if (!isSeekDragging.value) {
+      isSeekDragging.value = true;
+   }
+   lastDragSeekPosition = clamped;
+   queueSeek(clamped);
 }
 
 async function setVolume(level: number): Promise<void> {
@@ -515,6 +609,7 @@ async function setPlaybackRate(rate: number): Promise<void> {
    if (!player.value) {
       return;
    }
+   invalidateSeekInteraction();
    player.value = await player.value.setPlaybackRate(rate);
 }
 
@@ -530,6 +625,7 @@ async function stopTrack(): Promise<void> {
       return;
    }
 
+   invalidateSeekInteraction();
    const resp = await player.value.stop();
 
    player.value = resp.player;
@@ -549,7 +645,9 @@ onMounted(async () => {
 
    unlistenState = await p.listen((updated) => {
       player.value = updated;
-      currentTime.value = updated.currentTime;
+      if (seekPreviewTime.value === null) {
+         currentTime.value = updated.currentTime;
+      }
       duration.value = updated.duration;
       pushEvent({
          type: 'state',
@@ -562,7 +660,9 @@ onMounted(async () => {
    });
 
    unlistenTime = await p.onTimeUpdate((time) => {
-      currentTime.value = time.currentTime;
+      if (seekPreviewTime.value === null) {
+         currentTime.value = time.currentTime;
+      }
       if (time.duration > 0) {
          duration.value = time.duration;
       }
