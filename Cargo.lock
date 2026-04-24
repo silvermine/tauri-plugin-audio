@@ -111,7 +111,6 @@ dependencies = [
  "rodio",
  "serde",
  "signalsmith-rust",
- "symphonia",
  "thiserror 2.0.18",
  "tracing",
  "ureq",
@@ -2899,6 +2898,7 @@ dependencies = [
  "cpal",
  "dasp_sample",
  "num-rational",
+ "symphonia",
  "thiserror 2.0.18",
 ]
 

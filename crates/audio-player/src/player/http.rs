@@ -1,8 +1,6 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Duration;
 
-use symphonia::core::io::MediaSource;
-
 use super::source::infer_hint;
 
 use crate::error::{Error, Result};
@@ -195,16 +193,6 @@ impl Read for HttpAudioReader {
       }
 
       Ok(read)
-   }
-}
-
-impl MediaSource for HttpAudioReader {
-   fn is_seekable(&self) -> bool {
-      true
-   }
-
-   fn byte_len(&self) -> Option<u64> {
-      self.byte_len
    }
 }
 
