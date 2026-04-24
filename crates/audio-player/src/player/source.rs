@@ -4,6 +4,7 @@ use std::time::Duration;
 use rodio::{Sample, Source};
 
 use super::http::{RemoteSourceDescriptor, fetch_remote_source_descriptor};
+use super::prebuffered::PrebufferedSource;
 use super::stretch::StretchSource;
 use super::symphonia::SymphoniaSource;
 
@@ -60,7 +61,7 @@ pub(crate) fn open_source_at(
    };
    let duration = decoded_source.total_duration();
    let source = if (playback_rate - 1.0).abs() > f64::EPSILON {
-      Box::new(StretchSource::new(decoded_source, playback_rate)) as BoxedSource
+      Box::new(PrebufferedSource::new(Box::new(StretchSource::new(decoded_source, playback_rate)))?) as BoxedSource
    } else {
       decoded_source
    };

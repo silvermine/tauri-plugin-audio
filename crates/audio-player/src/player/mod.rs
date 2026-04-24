@@ -1,4 +1,5 @@
 mod http;
+mod prebuffered;
 mod source;
 mod stretch;
 mod symphonia;

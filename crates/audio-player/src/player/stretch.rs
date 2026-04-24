@@ -5,7 +5,7 @@ use rodio::source::SeekError as RodioSeekError;
 use rodio::{Sample, Source};
 use signalsmith_rust::PlaybackStream;
 
-const OUTPUT_CHUNK_FRAMES: usize = 512;
+const OUTPUT_CHUNK_FRAMES: usize = 2048;
 
 pub(crate) struct StretchSource {
    inner: Box<dyn Source<Item = Sample> + Send>,
@@ -165,7 +165,7 @@ impl Iterator for StretchSource {
 
 impl Source for StretchSource {
    fn current_span_len(&self) -> Option<usize> {
-      None
+      Some(self.output_buffer.len().saturating_sub(self.output_index))
    }
 
    fn channels(&self) -> rodio::ChannelCount {
@@ -188,5 +188,164 @@ impl Source for StretchSource {
 
       self.reset_pipeline();
       Ok(())
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use std::num::{NonZeroU16, NonZeroU32};
+
+   use super::*;
+
+   struct TestSource {
+      samples: Vec<Sample>,
+      index: usize,
+      channels: rodio::ChannelCount,
+      sample_rate: rodio::SampleRate,
+      total_duration: Option<Duration>,
+   }
+
+   impl TestSource {
+      fn new(samples: Vec<Sample>, channels: usize, sample_rate: u32) -> Self {
+         let frame_count = samples.len() / channels;
+
+         Self {
+            samples,
+            index: 0,
+            channels: NonZeroU16::new(channels as u16).unwrap(),
+            sample_rate: NonZeroU32::new(sample_rate).unwrap(),
+            total_duration: Some(Duration::from_secs_f64(frame_count as f64 / sample_rate as f64)),
+         }
+      }
+   }
+
+   impl Iterator for TestSource {
+      type Item = Sample;
+
+      fn next(&mut self) -> Option<Self::Item> {
+         let sample = self.samples.get(self.index).copied();
+
+         if sample.is_some() {
+            self.index += 1;
+         }
+
+         sample
+      }
+   }
+
+   impl Source for TestSource {
+      fn current_span_len(&self) -> Option<usize> {
+         Some(self.samples.len().saturating_sub(self.index))
+      }
+
+      fn channels(&self) -> rodio::ChannelCount {
+         self.channels
+      }
+
+      fn sample_rate(&self) -> rodio::SampleRate {
+         self.sample_rate
+      }
+
+      fn total_duration(&self) -> Option<Duration> {
+         self.total_duration
+      }
+   }
+
+   fn generate_signal(channels: usize, sample_rate: u32, frame_count: usize) -> Vec<Sample> {
+      let mut samples = Vec::with_capacity(frame_count * channels);
+
+      for frame in 0..frame_count {
+         let time = frame as f32 / sample_rate as f32;
+
+         for channel in 0..channels {
+            let frequency = match channel {
+               0 => 220.0,
+               1 => 330.0,
+               _ => 440.0 + (channel as f32 * 55.0),
+            };
+            let harmonic = match channel {
+               0 => 0.17,
+               1 => 0.11,
+               _ => 0.07,
+            };
+            let sample = ((2.0 * std::f32::consts::PI * frequency * time).sin() * 0.45)
+               + ((2.0 * std::f32::consts::PI * frequency * 2.0 * time).sin() * harmonic);
+
+            samples.push(sample);
+         }
+      }
+
+      samples
+   }
+
+   fn render_reference(
+      decoded_samples: &[Sample],
+      channels: usize,
+      sample_rate: u32,
+      playback_rate: f64,
+   ) -> Vec<Sample> {
+      let mut stream = PlaybackStream::with_rate(channels, sample_rate as f32, playback_rate as f32);
+      let input_latency_frames = stream.input_latency().max(1);
+      let output_latency_frames = stream.output_latency().max(1);
+      let chunk_frames = OUTPUT_CHUNK_FRAMES
+         .max(input_latency_frames.saturating_add(output_latency_frames))
+         .max(1);
+      let total_frames = decoded_samples.len() / channels;
+      let mut cursor_frames = 0;
+      let mut output = Vec::new();
+
+      while cursor_frames < total_frames {
+         let requested_input_frames = stream.input_samples_for_output(chunk_frames);
+         let remaining_frames = total_frames - cursor_frames;
+         let actual_input_frames = remaining_frames.min(requested_input_frames);
+         let start_sample = cursor_frames * channels;
+         let end_sample = start_sample + (actual_input_frames * channels);
+         let mut input_block = decoded_samples[start_sample..end_sample].to_vec();
+
+         if actual_input_frames < requested_input_frames {
+            input_block.resize(requested_input_frames * channels, 0.0);
+         }
+
+         let mut output_block = vec![0.0; chunk_frames * channels];
+         let consumed = stream.process_interleaved(&input_block, &mut output_block);
+
+         assert_eq!(consumed, requested_input_frames);
+
+         output.extend_from_slice(&output_block);
+         cursor_frames += actual_input_frames;
+      }
+
+      let mut flush_block = vec![0.0; output_latency_frames * channels];
+      stream.flush_interleaved(&mut flush_block);
+      output.extend_from_slice(&flush_block);
+
+      output
+   }
+
+   fn assert_signal_matches_reference(channels: usize, playback_rate: f64) {
+      let sample_rate = 48_000;
+      let frame_count = 72_000;
+      let decoded_samples = generate_signal(channels, sample_rate, frame_count);
+      let expected = render_reference(&decoded_samples, channels, sample_rate, playback_rate);
+      let source = TestSource::new(decoded_samples, channels, sample_rate);
+      let actual = StretchSource::new(Box::new(source), playback_rate).collect::<Vec<Sample>>();
+      let max_difference = actual
+         .iter()
+         .zip(expected.iter())
+         .map(|(lhs, rhs)| (lhs - rhs).abs())
+         .fold(0.0_f32, f32::max);
+
+      assert_eq!(actual.len(), expected.len());
+      assert!(max_difference <= 1.0e-6, "max_difference={max_difference}");
+   }
+
+   #[test]
+   fn stretch_source_matches_reference_for_slow_playback() {
+      assert_signal_matches_reference(1, 0.75);
+   }
+
+   #[test]
+   fn stretch_source_matches_reference_for_fast_playback() {
+      assert_signal_matches_reference(2, 1.25);
    }
 }

@@ -296,7 +296,7 @@ impl Iterator for SymphoniaSource {
 
 impl Source for SymphoniaSource {
    fn current_span_len(&self) -> Option<usize> {
-      None
+      Some(self.pending_samples.len().saturating_sub(self.pending_index))
    }
 
    fn channels(&self) -> rodio::ChannelCount {
