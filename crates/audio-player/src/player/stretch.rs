@@ -3,16 +3,16 @@ use std::time::Duration;
 
 use rodio::source::SeekError as RodioSeekError;
 use rodio::{Sample, Source};
-use signalsmith_stretch::Stretch;
+use signalsmith_rust::PlaybackStream;
+
+const OUTPUT_CHUNK_FRAMES: usize = 512;
 
 pub(crate) struct StretchSource {
    inner: Box<dyn Source<Item = Sample> + Send>,
-   stretch: Stretch,
+   stretch: PlaybackStream,
    channels: rodio::ChannelCount,
    sample_rate: rodio::SampleRate,
    total_duration: Option<Duration>,
-   playback_rate: f64,
-   input_latency_frames: usize,
    output_latency_frames: usize,
    chunk_frames: usize,
    input_buffer: Vec<Sample>,
@@ -27,10 +27,16 @@ impl StretchSource {
       let channels = inner.channels();
       let sample_rate = inner.sample_rate();
       let total_duration = inner.total_duration();
-      let stretch = Stretch::preset_default(channels.get() as u32, sample_rate.get());
+      let stretch = PlaybackStream::with_rate(
+         channels.get() as usize,
+         sample_rate.get() as f32,
+         playback_rate as f32,
+      );
       let input_latency_frames = stretch.input_latency().max(1);
       let output_latency_frames = stretch.output_latency().max(1);
-      let chunk_frames = input_latency_frames.saturating_add(output_latency_frames).max(1);
+      let chunk_frames = OUTPUT_CHUNK_FRAMES
+         .max(input_latency_frames.saturating_add(output_latency_frames))
+         .max(1);
 
       Self {
          inner,
@@ -38,8 +44,6 @@ impl StretchSource {
          channels,
          sample_rate,
          total_duration,
-         playback_rate,
-         input_latency_frames,
          output_latency_frames,
          chunk_frames,
          input_buffer: Vec::new(),
@@ -58,9 +62,11 @@ impl StretchSource {
       self.chunk_frames
    }
 
-   fn input_chunk_frames(&self) -> usize {
-      let scaled_frames = (self.output_chunk_frames() as f64 * self.playback_rate).ceil() as usize;
-      scaled_frames.max(self.input_latency_frames).max(1)
+   fn prepare_output_buffer(&mut self, frame_count: usize) {
+      let channel_count = self.channel_count();
+
+      self.output_buffer.clear();
+      self.output_buffer.resize(frame_count * channel_count, 0.0);
    }
 
    fn refill_output_buffer(&mut self) -> bool {
@@ -75,7 +81,9 @@ impl StretchSource {
          return false;
       }
 
-      let input_frames = self.read_input_frames(self.input_chunk_frames());
+      let requested_output_frames = self.output_chunk_frames();
+      let requested_input_frames = self.stretch.input_samples_for_output(requested_output_frames);
+      let input_frames = self.read_input_frames(requested_input_frames);
 
       if input_frames == 0 {
          if !self.input_exhausted {
@@ -83,16 +91,23 @@ impl StretchSource {
          }
 
          let flush_frames = self.output_latency_frames;
-         self.output_buffer.resize(flush_frames * self.channel_count(), 0.0);
-         self.stretch.flush(&mut self.output_buffer);
+         self.prepare_output_buffer(flush_frames);
+         self.stretch.flush_interleaved(&mut self.output_buffer);
          self.flushed = true;
-         return true;
+
+         return !self.output_buffer.is_empty();
       }
 
-      let output_frames = ((input_frames as f64) / self.playback_rate).round() as usize;
-      let output_frames = output_frames.max(1);
-      self.output_buffer.resize(output_frames * self.channel_count(), 0.0);
-      self.stretch.process(&self.input_buffer, &mut self.output_buffer);
+      if input_frames < requested_input_frames {
+         self
+            .input_buffer
+            .resize(requested_input_frames * self.channel_count(), 0.0);
+      }
+
+      self.prepare_output_buffer(requested_output_frames);
+      self
+         .stretch
+         .process_interleaved(&self.input_buffer, &mut self.output_buffer);
 
       true
    }
@@ -112,7 +127,10 @@ impl StretchSource {
          self.input_buffer.push(sample);
       }
 
-      self.input_buffer.len() / self.channel_count()
+      let input_frames = self.input_buffer.len() / self.channel_count();
+      self.input_buffer.truncate(input_frames * self.channel_count());
+
+      input_frames
    }
 
    fn reset_pipeline(&mut self) {
