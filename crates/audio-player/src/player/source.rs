@@ -6,7 +6,6 @@ use std::time::Duration;
 use rodio::{Decoder, Sample, Source};
 
 use super::http::{HttpAudioReader, RemoteSourceDescriptor, fetch_remote_source_descriptor};
-use super::prebuffered::PrebufferedSource;
 use super::stretch::StretchSource;
 
 use crate::error::{Error, Result};
@@ -56,10 +55,7 @@ pub(crate) fn open_source_at(
       .map(|value| value.as_secs_f64())
       .unwrap_or(0.0);
    let source = if (playback_rate - 1.0).abs() > f64::EPSILON {
-      Box::new(PrebufferedSource::new(Box::new(StretchSource::new(
-         decoded_source,
-         playback_rate,
-      )))?) as BoxedSource
+      Box::new(StretchSource::new(decoded_source, playback_rate)) as BoxedSource
    } else {
       decoded_source
    };
