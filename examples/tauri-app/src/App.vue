@@ -38,10 +38,11 @@
                type="range"
                class="progress-bar"
                :class="{ inactive: !canSeek }"
-               :value="currentTime"
+               :value="progressValue"
                :max="duration || 1"
                step="0.1"
-               @input="canSeek && seekTo(Number(($event.target as HTMLInputElement).value))"
+               @input="canSeek && previewSeek(Number(($event.target as HTMLInputElement).value))"
+               @change="canSeek && commitSeekPreview(Number(($event.target as HTMLInputElement).value))"
             />
 
             <!-- Title + time -->
@@ -184,7 +185,7 @@
             </div>
          </div>
          <div class="event-log-entries" ref="eventLogEl">
-            <template v-for="(entry, i) in filteredEvents" :key="i">
+            <template v-for="entry in filteredEvents" :key="`${entry.type}-${entry.timestamp}-${entry.summary}`">
                <div class="event-entry" :class="entry.type">
                   <div class="event-row" @click="entry.expanded = !entry.expanded">
                      <span class="event-badge" :class="entry.type">{{ entry.label }}</span>
@@ -213,6 +214,7 @@ import type { PlayerWithAnyStatus, AudioMetadata } from '@silvermine/tauri-plugi
 
 const player = ref<PlayerWithAnyStatus | null>(null);
 const currentTime = ref(0);
+const seekPreviewTime = ref<number | null>(null);
 const duration = ref(0);
 const SAMPLE_TRACK = {
    src: 'https://www.learningcontainer.com/wp-content/uploads/2020/02/Kalimba.mp3',
@@ -347,8 +349,12 @@ const trackTitle = computed(() => {
    return player.value.title || player.value.src?.split('/').pop() || 'Unknown';
 });
 
+const progressValue = computed(() => {
+   return seekPreviewTime.value ?? currentTime.value;
+});
+
 const timeDisplay = computed(() => {
-   return `${formatTime(currentTime.value)} / ${formatTime(duration.value)}`;
+   return `${formatTime(progressValue.value)} / ${formatTime(duration.value)}`;
 });
 
 const isPlaying = computed(() => player.value?.status === PlaybackStatus.Playing);
@@ -393,6 +399,16 @@ function formatTime(seconds: number): string {
    const s = Math.floor(seconds % 60);
 
    return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function clampSeekPosition(position: number): number {
+   const maxPosition = duration.value > 0 ? duration.value : position;
+
+   return Math.max(0, Math.min(position, maxPosition));
+}
+
+function previewSeek(position: number): void {
+   seekPreviewTime.value = clampSeekPosition(position);
 }
 
 function toggleSettingsMenu(): void {
@@ -479,11 +495,11 @@ async function seekRelative(offset: number): Promise<void> {
       return;
    }
 
-   const pos = Math.max(0, currentTime.value + offset);
-   const resp = await player.value.seek(pos);
+   await seekTo((seekPreviewTime.value ?? currentTime.value) + offset);
+}
 
-   player.value = resp.player;
-   currentTime.value = resp.player.currentTime;
+async function commitSeekPreview(position: number): Promise<void> {
+   await seekTo(position);
 }
 
 async function seekTo(position: number): Promise<void> {
@@ -491,10 +507,18 @@ async function seekTo(position: number): Promise<void> {
       return;
    }
 
-   const resp = await player.value.seek(position);
+   const targetPosition = clampSeekPosition(position);
 
-   player.value = resp.player;
-   currentTime.value = resp.player.currentTime;
+   seekPreviewTime.value = targetPosition;
+
+   try {
+      const resp = await player.value.seek(targetPosition);
+
+      player.value = resp.player;
+      currentTime.value = resp.player.currentTime;
+   } finally {
+      seekPreviewTime.value = null;
+   }
 }
 
 async function setVolume(level: number): Promise<void> {
@@ -534,6 +558,7 @@ async function stopTrack(): Promise<void> {
 
    player.value = resp.player;
    currentTime.value = 0;
+   seekPreviewTime.value = null;
    duration.value = 0;
    showSettings.value = false;
 }
@@ -550,6 +575,9 @@ onMounted(async () => {
    unlistenState = await p.listen((updated) => {
       player.value = updated;
       currentTime.value = updated.currentTime;
+      if (updated.status === PlaybackStatus.Idle) {
+         seekPreviewTime.value = null;
+      }
       duration.value = updated.duration;
       pushEvent({
          type: 'state',
