@@ -2,13 +2,17 @@ use std::error::Error;
 use std::fs::File;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use rodio::{Decoder, DeviceSinkBuilder, Player, Source, buffer::SamplesBuffer};
+use rodio::source::SeekError as RodioSeekError;
+use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 use signalsmith::PlaybackStream;
 
 const SOURCE_DURATION_SECONDS: usize = 5;
 const OUTPUT_BLOCK_FRAMES: usize = 512;
 const FLUSH_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 4;
+
+type BoxedSource = Box<dyn Source<Item = f32> + Send>;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -17,191 +21,277 @@ fn fixture_path() -> PathBuf {
         .join("music.wav")
 }
 
-fn read_fixture_interleaved() -> Result<(NonZeroU16, NonZeroU32, Vec<f32>), Box<dyn Error>> {
+fn open_fixture_decoder() -> Result<(BoxedSource, NonZeroU16, NonZeroU32, Option<Duration>), Box<dyn Error>> {
     let file = File::open(fixture_path())?;
     let decoder = Decoder::try_from(file)?;
     let channels = decoder.channels();
     let sample_rate_hz = decoder.sample_rate();
-    let samples = decoder.collect::<Vec<f32>>();
+    let total_duration = decoder.total_duration();
 
-    Ok((channels, sample_rate_hz, samples))
+    Ok((Box::new(decoder), channels, sample_rate_hz, total_duration))
 }
 
-fn preview_source_frames(sample_rate_hz: u32, available_frames: usize) -> usize {
-    available_frames.min(sample_rate_hz as usize * SOURCE_DURATION_SECONDS)
+fn preview_source_frames(sample_rate_hz: u32) -> usize {
+    sample_rate_hz as usize * SOURCE_DURATION_SECONDS
 }
 
-fn render_playback_segment(
-    stream: &mut PlaybackStream,
-    input_interleaved: &[f32],
-    channels: usize,
-    source_frames: usize,
-    playback_rate: f32,
-    output: &mut Vec<f32>,
+fn available_source_frames(total_duration: Option<Duration>, sample_rate_hz: u32) -> Option<usize> {
+    total_duration.map(|duration| (duration.as_secs_f64() * sample_rate_hz as f64).floor() as usize)
+}
+
+fn assert_fixture_length(
+    total_duration: Option<Duration>,
+    sample_rate_hz: NonZeroU32,
+    required_frames: usize,
+    label: &str,
 ) {
-    let mut cursor = 0_usize;
-    let source_samples = source_frames * channels;
-
-    assert!(
-        source_samples <= input_interleaved.len(),
-        "requested source segment exceeds fixture length"
-    );
-
-    while cursor < source_samples {
-        let remaining_frames = source_frames - cursor / channels;
-        let mut output_frames = OUTPUT_BLOCK_FRAMES
-            .min(((remaining_frames as f64 / playback_rate as f64).ceil() as usize).max(1));
-
-        while stream.input_samples_for_output(output_frames) > remaining_frames {
-            output_frames -= 1;
-        }
-
-        let input_frames = stream.input_samples_for_output(output_frames);
-        let next_cursor = cursor + input_frames * channels;
-        assert!(
-            next_cursor <= source_samples,
-            "audible fixture too short for playback_rate={playback_rate}: need {next_cursor} samples"
-        );
-
-        let input_block = &input_interleaved[cursor..next_cursor];
-        let mut output_block = vec![0.0_f32; output_frames * channels];
-        let consumed = stream.process_interleaved(input_block, &mut output_block);
-
-        assert_eq!(consumed, input_frames);
-        output.extend_from_slice(&output_block);
-        cursor = next_cursor;
+    if let Some(available_frames) = available_source_frames(total_duration, sample_rate_hz.get()) {
+        assert!(required_frames <= available_frames, "{label} exceeds fixture length");
     }
 }
 
-fn render_playback_rate(
-    input_interleaved: &[f32],
+struct StreamingPlaybackSource {
+    input: BoxedSource,
+    stream: PlaybackStream,
     channels: NonZeroU16,
     sample_rate_hz: NonZeroU32,
-    source_frames: usize,
-    playback_rate: f32,
-) -> Vec<f32> {
-    let channels = usize::from(channels.get());
-    let mut stream =
-        PlaybackStream::with_rate(channels, sample_rate_hz.get() as f32, playback_rate);
-    let estimated_output_frames = (source_frames as f64 / playback_rate as f64).ceil() as usize;
-    let mut output = Vec::with_capacity((estimated_output_frames + FLUSH_FRAMES) * channels);
-
-    assert!(channels > 0, "fixture WAV must have at least one channel");
-    render_playback_segment(
-        &mut stream,
-        input_interleaved,
-        channels,
-        source_frames,
-        playback_rate,
-        &mut output,
-    );
-
-    let mut flush_block = vec![0.0_f32; FLUSH_FRAMES * channels];
-    stream.flush_interleaved(&mut flush_block);
-    output.extend_from_slice(&flush_block);
-
-    let trim_start_frames = (stream.output_latency() * 2).min(output.len() / channels / 4);
-    let trim_start = trim_start_frames * channels;
-
-    output[trim_start..].to_vec()
+    input_buffer: Vec<f32>,
+    output_buffer: Vec<f32>,
+    output_index: usize,
+    current_input_frame: usize,
+    current_segment_end_frame: usize,
+    pending_seek_frame: Option<usize>,
+    final_end_frame: usize,
+    trim_frames_remaining: usize,
+    flushed: bool,
+    ended: bool,
 }
 
-fn render_playback_rate_with_seek_segments(
-    input_interleaved: &[f32],
-    channels: NonZeroU16,
-    sample_rate_hz: NonZeroU32,
-    playback_rate: f32,
-    first_segment_end_frames: usize,
-    seek_frame: usize,
-    second_segment_end_frame: usize,
-) -> Vec<f32> {
-    let channels = usize::from(channels.get());
-    let total_frames = input_interleaved.len() / channels;
-    let first_segment_frames = first_segment_end_frames;
-    let second_segment_frames = second_segment_end_frame - seek_frame;
-    let mut stream =
-        PlaybackStream::with_rate(channels, sample_rate_hz.get() as f32, playback_rate);
-    let estimated_output_frames = (first_segment_frames as f64 / playback_rate as f64).ceil() as usize
-        + (second_segment_frames as f64 / playback_rate as f64).ceil() as usize;
-    let mut output = Vec::with_capacity((estimated_output_frames + FLUSH_FRAMES) * channels);
+impl StreamingPlaybackSource {
+    fn new(
+        input: BoxedSource,
+        channels: NonZeroU16,
+        sample_rate_hz: NonZeroU32,
+        playback_rate: f32,
+        current_segment_end_frame: usize,
+        pending_seek_frame: Option<usize>,
+        final_end_frame: usize,
+    ) -> Self {
+        let stream = PlaybackStream::with_rate(
+            usize::from(channels.get()),
+            sample_rate_hz.get() as f32,
+            playback_rate,
+        );
+        let trim_frames_remaining = stream.output_latency() * 2;
 
-    assert!(channels > 0, "fixture WAV must have at least one channel");
-    assert!(
-        first_segment_end_frames <= total_frames,
-        "first segment exceeds fixture length"
-    );
-    assert!(seek_frame < second_segment_end_frame, "seek frame must precede segment end");
-    assert!(
-        second_segment_end_frame <= total_frames,
-        "second segment exceeds fixture length"
-    );
+        Self {
+            input,
+            stream,
+            channels,
+            sample_rate_hz,
+            input_buffer: Vec::new(),
+            output_buffer: Vec::new(),
+            output_index: 0,
+            current_input_frame: 0,
+            current_segment_end_frame,
+            pending_seek_frame,
+            final_end_frame,
+            trim_frames_remaining,
+            flushed: false,
+            ended: false,
+        }
+    }
 
-    render_playback_segment(
-        &mut stream,
-        input_interleaved,
-        channels,
-        first_segment_frames,
-        playback_rate,
-        &mut output,
-    );
+    fn channel_count(&self) -> usize {
+        usize::from(self.channels.get())
+    }
 
-    let seek_offset = seek_frame * channels;
-    let seek_input = &input_interleaved[seek_offset..];
-    let seek_input_frames = stream.output_seek_interleaved(seek_input);
+    fn clear_output_buffer(&mut self) {
+        self.output_buffer.clear();
+        self.output_index = 0;
+    }
 
-    assert!(
-        seek_input_frames <= second_segment_frames,
-        "seek warmup exceeds remaining segment length"
-    );
+    fn read_exact_input_frames(&mut self, input_frames: usize, context: &str) {
+        let input_samples = input_frames * self.channel_count();
 
-    render_playback_segment(
-        &mut stream,
-        &seek_input[seek_input_frames * channels..],
-        channels,
-        second_segment_frames - seek_input_frames,
-        playback_rate,
-        &mut output,
-    );
+        self.input_buffer.clear();
+        self.input_buffer.reserve(input_samples);
 
-    let mut flush_block = vec![0.0_f32; FLUSH_FRAMES * channels];
-    stream.flush_interleaved(&mut flush_block);
-    output.extend_from_slice(&flush_block);
+        while self.input_buffer.len() < input_samples {
+            let Some(sample) = self.input.next() else {
+                panic!("audible fixture too short during {context}");
+            };
 
-    let trim_start_frames = (stream.output_latency() * 2).min(output.len() / channels / 4);
-    let trim_start = trim_start_frames * channels;
+            self.input_buffer.push(sample);
+        }
 
-    output[trim_start..].to_vec()
+        self.current_input_frame += input_frames;
+    }
+
+    fn perform_pending_seek(&mut self, seek_frame: usize) -> Result<(), RodioSeekError> {
+        self
+            .input
+            .try_seek(Duration::from_secs_f64(seek_frame as f64 / self.sample_rate_hz.get() as f64))?;
+
+        self.current_input_frame = seek_frame;
+        self.current_segment_end_frame = self.final_end_frame;
+        self.flushed = false;
+        self.ended = false;
+        self.clear_output_buffer();
+
+        let seek_input_frames = self.stream.output_seek_length();
+        self.read_exact_input_frames(seek_input_frames, "seek warmup");
+        self.stream.output_seek_interleaved(&self.input_buffer);
+        self.input_buffer.clear();
+
+        Ok(())
+    }
+
+    fn flush_output(&mut self) -> bool {
+        if self.flushed {
+            return false;
+        }
+
+        self.output_buffer.resize(FLUSH_FRAMES * self.channel_count(), 0.0);
+        self.stream.flush_interleaved(&mut self.output_buffer);
+        self.flushed = true;
+
+        !self.output_buffer.is_empty()
+    }
+
+    fn refill_output_buffer(&mut self) -> bool {
+        if self.output_index < self.output_buffer.len() {
+            return true;
+        }
+
+        self.clear_output_buffer();
+
+        loop {
+            if self.current_input_frame >= self.current_segment_end_frame {
+                if let Some(seek_frame) = self.pending_seek_frame.take() {
+                    self.perform_pending_seek(seek_frame)
+                        .unwrap_or_else(|error| panic!("failed to seek audible source: {error}"));
+                    continue;
+                }
+
+                return self.flush_output();
+            }
+
+            break;
+        }
+
+        let remaining_frames = self.current_segment_end_frame - self.current_input_frame;
+        let mut output_frames = OUTPUT_BLOCK_FRAMES.max(1);
+
+        while self.stream.input_samples_for_output(output_frames) > remaining_frames {
+            output_frames -= 1;
+        }
+
+        let input_frames = self.stream.input_samples_for_output(output_frames);
+
+        self.read_exact_input_frames(input_frames, "streaming playback");
+        self.output_buffer.resize(output_frames * self.channel_count(), 0.0);
+
+        let consumed = self
+            .stream
+            .process_interleaved(&self.input_buffer, &mut self.output_buffer);
+
+        assert_eq!(consumed, input_frames);
+        true
+    }
+
+    fn discard_initial_trim(&mut self) -> bool {
+        while self.trim_frames_remaining > 0 {
+            if self.output_index >= self.output_buffer.len() && !self.refill_output_buffer() {
+                return false;
+            }
+
+            let available_frames = (self.output_buffer.len() - self.output_index) / self.channel_count();
+            let discard_frames = available_frames.min(self.trim_frames_remaining);
+
+            self.output_index += discard_frames * self.channel_count();
+            self.trim_frames_remaining -= discard_frames;
+        }
+
+        true
+    }
 }
 
-fn play_rendered_audio(
-    channels: NonZeroU16,
-    sample_rate_hz: NonZeroU32,
-    samples: Vec<f32>,
-) -> Result<(), Box<dyn Error>> {
+impl Iterator for StreamingPlaybackSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.discard_initial_trim() {
+            self.ended = true;
+            return None;
+        }
+
+        while self.output_index >= self.output_buffer.len() {
+            if !self.refill_output_buffer() {
+                self.ended = true;
+                return None;
+            }
+
+            if self.output_buffer.is_empty() {
+                self.ended = true;
+                return None;
+            }
+        }
+
+        let sample = self.output_buffer.get(self.output_index).copied();
+        self.output_index += 1;
+        sample
+    }
+}
+
+impl Source for StreamingPlaybackSource {
+    fn current_span_len(&self) -> Option<usize> {
+        if self.ended {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn channels(&self) -> NonZeroU16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> NonZeroU32 {
+        self.sample_rate_hz
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+fn play_streaming_audio(source: StreamingPlaybackSource) -> Result<(), Box<dyn Error>> {
     let sink = DeviceSinkBuilder::open_default_sink()?;
     let player = Player::connect_new(sink.mixer());
 
-    player.append(SamplesBuffer::new(channels, sample_rate_hz, samples));
+    player.append(source);
     player.sleep_until_end();
 
     Ok(())
 }
 
 fn play_fixture_at_rate(playback_rate: f32) -> Result<(), Box<dyn Error>> {
-    let (channels, sample_rate_hz, source_input) = read_fixture_interleaved()?;
-    let source_frames = preview_source_frames(
-        sample_rate_hz.get(),
-        source_input.len() / usize::from(channels.get()),
-    );
-    let rendered = render_playback_rate(
-        &source_input,
+    let (input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+    let source_frames = preview_source_frames(sample_rate_hz.get());
+
+    assert!(channels.get() > 0, "fixture WAV must have at least one channel");
+    assert_fixture_length(total_duration, sample_rate_hz, source_frames, "preview duration");
+
+    play_streaming_audio(StreamingPlaybackSource::new(
+        input,
         channels,
         sample_rate_hz,
-        source_frames,
         playback_rate,
-    );
-
-    play_rendered_audio(channels, sample_rate_hz, rendered)
+        source_frames,
+        None,
+        source_frames,
+    ))
 }
 
 fn play_fixture_at_rate_with_seek(
@@ -210,13 +300,14 @@ fn play_fixture_at_rate_with_seek(
     seek_seconds: usize,
     second_segment_end_seconds: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let (channels, sample_rate_hz, source_input) = read_fixture_interleaved()?;
-    let available_frames = source_input.len() / usize::from(channels.get());
-    let source_frames = preview_source_frames(sample_rate_hz.get(), available_frames);
+    let (input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+    let source_frames = preview_source_frames(sample_rate_hz.get());
     let first_segment_end_frames = sample_rate_hz.get() as usize * first_segment_end_seconds;
     let seek_frame = sample_rate_hz.get() as usize * seek_seconds;
     let second_segment_end_frame = sample_rate_hz.get() as usize * second_segment_end_seconds;
 
+    assert!(channels.get() > 0, "fixture WAV must have at least one channel");
+    assert_fixture_length(total_duration, sample_rate_hz, source_frames, "audible preview length");
     assert!(
         first_segment_end_frames <= source_frames,
         "first segment exceeds audible preview length"
@@ -227,17 +318,15 @@ fn play_fixture_at_rate_with_seek(
         "second segment exceeds audible preview length"
     );
 
-    let rendered = render_playback_rate_with_seek_segments(
-        &source_input,
+    play_streaming_audio(StreamingPlaybackSource::new(
+        input,
         channels,
         sample_rate_hz,
         playback_rate,
         first_segment_end_frames,
-        seek_frame,
+        Some(seek_frame),
         second_segment_end_frame,
-    );
-
-    play_rendered_audio(channels, sample_rate_hz, rendered)
+    ))
 }
 
 #[test]

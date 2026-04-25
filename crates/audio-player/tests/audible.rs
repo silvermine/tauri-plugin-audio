@@ -129,6 +129,13 @@ fn play_fixture_at_rate_with_seek(
 
 #[test]
 #[ignore = "manual audible check; plays audio-player output through rodio"]
+fn plays_fixture_at_one_x_with_seek_from_five_seconds_to_two_seconds(
+) -> Result<(), Box<dyn Error>> {
+   play_fixture_at_rate_with_seek(1.0, 5, 2, 5)
+}
+
+#[test]
+#[ignore = "manual audible check; plays audio-player output through rodio"]
 fn plays_fixture_at_one_point_two_five_x() -> Result<(), Box<dyn Error>> {
    play_fixture_at_rate(1.25, 5)
 }
