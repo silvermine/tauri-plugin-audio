@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use rodio::Player;
 use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
-use rodio::{Player};
 use tracing::warn;
 
 use self::source::{SourceDescriptor, load_source_descriptor, open_source_at};
@@ -102,11 +102,7 @@ impl RodioAudioPlayer {
       lock_inner(&self.inner).state.clone()
    }
 
-   pub fn load(
-      &self,
-      src: &str,
-      metadata: Option<AudioMetadata>,
-   ) -> Result<AudioActionResponse> {
+   pub fn load(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
       let meta = metadata.unwrap_or_default();
 
       let (load_generation, playback_rate) = {
@@ -582,7 +578,8 @@ fn monitor_loop(
 
       let (pos, duration, is_empty) = match &guard.playback {
          Some(ctx) => {
-            let pos = ctx.position_offset + (ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate);
+            let pos =
+               ctx.position_offset + (ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate);
             (pos, ctx.duration, ctx.sink.empty())
          }
          None => break,

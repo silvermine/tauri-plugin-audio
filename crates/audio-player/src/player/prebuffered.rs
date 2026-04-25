@@ -36,7 +36,9 @@ impl PrebufferedSource {
          .spawn(move || {
             worker_loop(inner, sender);
          })
-         .map_err(|error| Error::Audio(format!("Failed to spawn audio prebuffer worker: {error}")))?;
+         .map_err(|error| {
+            Error::Audio(format!("Failed to spawn audio prebuffer worker: {error}"))
+         })?;
 
       Ok(Self {
          receiver,
@@ -154,7 +156,9 @@ mod tests {
             index: 0,
             channels: NonZeroU16::new(channels as u16).unwrap(),
             sample_rate: NonZeroU32::new(sample_rate).unwrap(),
-            total_duration: Some(Duration::from_secs_f64(frame_count as f64 / sample_rate as f64)),
+            total_duration: Some(Duration::from_secs_f64(
+               frame_count as f64 / sample_rate as f64,
+            )),
          }
       }
    }
@@ -212,7 +216,9 @@ mod tests {
    fn prebuffered_source_preserves_mono_samples() {
       let expected = generate_signal(1, 48_000, 24_000);
       let source = TestSource::new(expected.clone(), 1, 48_000);
-      let actual = PrebufferedSource::new(Box::new(source)).unwrap().collect::<Vec<Sample>>();
+      let actual = PrebufferedSource::new(Box::new(source))
+         .unwrap()
+         .collect::<Vec<Sample>>();
 
       assert_eq!(actual, expected);
    }
@@ -221,7 +227,9 @@ mod tests {
    fn prebuffered_source_preserves_stereo_samples() {
       let expected = generate_signal(2, 48_000, 24_000);
       let source = TestSource::new(expected.clone(), 2, 48_000);
-      let actual = PrebufferedSource::new(Box::new(source)).unwrap().collect::<Vec<Sample>>();
+      let actual = PrebufferedSource::new(Box::new(source))
+         .unwrap()
+         .collect::<Vec<Sample>>();
 
       assert_eq!(actual, expected);
    }

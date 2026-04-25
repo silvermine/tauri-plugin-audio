@@ -10,15 +10,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const POSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn fixture_path() -> Result<PathBuf, Box<dyn Error>> {
-   Ok(
-      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-         .join("..")
-         .join("signalsmith")
-         .join("tests")
-         .join("fixtures")
-         .join("music.wav")
-         .canonicalize()?,
-   )
+   Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      .join("..")
+      .join("signalsmith")
+      .join("tests")
+      .join("fixtures")
+      .join("music.wav")
+      .canonicalize()?)
 }
 
 fn wait_for_position(player: &RodioAudioPlayer, target_time: f64) -> Result<(), Box<dyn Error>> {
@@ -43,8 +41,7 @@ fn wait_for_position(player: &RodioAudioPlayer, target_time: f64) -> Result<(), 
          return Err(
             format!(
                "playback ended at {}s before reaching target {}s",
-               state.current_time,
-               target_time,
+               state.current_time, target_time,
             )
             .into(),
          );
@@ -54,9 +51,7 @@ fn wait_for_position(player: &RodioAudioPlayer, target_time: f64) -> Result<(), 
          return Err(
             format!(
                "timed out waiting for playback to reach {}s; current state: {:?} at {}s",
-               target_time,
-               state.status,
-               state.current_time,
+               target_time, state.status, state.current_time,
             )
             .into(),
          );
@@ -129,8 +124,8 @@ fn play_fixture_at_rate_with_seek(
 
 #[test]
 #[ignore = "manual audible check; plays audio-player output through rodio"]
-fn plays_fixture_at_one_x_with_seek_from_five_seconds_to_two_seconds(
-) -> Result<(), Box<dyn Error>> {
+fn plays_fixture_at_one_x_with_seek_from_five_seconds_to_two_seconds() -> Result<(), Box<dyn Error>>
+{
    play_fixture_at_rate_with_seek(1.0, 5, 2, 5)
 }
 
@@ -142,7 +137,7 @@ fn plays_fixture_at_one_point_two_five_x() -> Result<(), Box<dyn Error>> {
 
 #[test]
 #[ignore = "manual audible check; plays audio-player output through rodio"]
-fn plays_fixture_at_one_point_two_five_x_with_seek_from_five_seconds_to_two_seconds(
-) -> Result<(), Box<dyn Error>> {
+fn plays_fixture_at_one_point_two_five_x_with_seek_from_five_seconds_to_two_seconds()
+-> Result<(), Box<dyn Error>> {
    play_fixture_at_rate_with_seek(1.25, 5, 2, 5)
 }

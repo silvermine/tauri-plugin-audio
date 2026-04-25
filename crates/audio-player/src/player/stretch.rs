@@ -82,7 +82,9 @@ impl StretchSource {
       }
 
       let requested_output_frames = self.output_chunk_frames();
-      let requested_input_frames = self.stretch.input_samples_for_output(requested_output_frames);
+      let requested_input_frames = self
+         .stretch
+         .input_samples_for_output(requested_output_frames);
       let input_frames = self.read_input_frames(requested_input_frames);
 
       if input_frames == 0 {
@@ -128,7 +130,9 @@ impl StretchSource {
       }
 
       let input_frames = self.input_buffer.len() / self.channel_count();
-      self.input_buffer.truncate(input_frames * self.channel_count());
+      self
+         .input_buffer
+         .truncate(input_frames * self.channel_count());
 
       input_frames
    }
@@ -181,10 +185,9 @@ impl Source for StretchSource {
    }
 
    fn try_seek(&mut self, position: Duration) -> std::result::Result<(), RodioSeekError> {
-      self
-         .inner
-         .try_seek(position)
-         .map_err(|error| RodioSeekError::Other(Arc::new(std::io::Error::other(error.to_string()))))?;
+      self.inner.try_seek(position).map_err(|error| {
+         RodioSeekError::Other(Arc::new(std::io::Error::other(error.to_string())))
+      })?;
 
       self.reset_pipeline();
       Ok(())
@@ -214,7 +217,9 @@ mod tests {
             index: 0,
             channels: NonZeroU16::new(channels as u16).unwrap(),
             sample_rate: NonZeroU32::new(sample_rate).unwrap(),
-            total_duration: Some(Duration::from_secs_f64(frame_count as f64 / sample_rate as f64)),
+            total_duration: Some(Duration::from_secs_f64(
+               frame_count as f64 / sample_rate as f64,
+            )),
          }
       }
    }
@@ -284,7 +289,8 @@ mod tests {
       sample_rate: u32,
       playback_rate: f64,
    ) -> Vec<Sample> {
-      let mut stream = PlaybackStream::with_rate(channels, sample_rate as f32, playback_rate as f32);
+      let mut stream =
+         PlaybackStream::with_rate(channels, sample_rate as f32, playback_rate as f32);
       let input_latency_frames = stream.input_latency().max(1);
       let output_latency_frames = stream.output_latency().max(1);
       let chunk_frames = OUTPUT_CHUNK_FRAMES

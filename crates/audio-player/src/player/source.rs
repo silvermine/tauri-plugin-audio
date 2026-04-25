@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rodio::{Decoder, Sample, Source};
@@ -56,7 +56,10 @@ pub(crate) fn open_source_at(
       .map(|value| value.as_secs_f64())
       .unwrap_or(0.0);
    let source = if (playback_rate - 1.0).abs() > f64::EPSILON {
-      Box::new(PrebufferedSource::new(Box::new(StretchSource::new(decoded_source, playback_rate)))?) as BoxedSource
+      Box::new(PrebufferedSource::new(Box::new(StretchSource::new(
+         decoded_source,
+         playback_rate,
+      )))?) as BoxedSource
    } else {
       decoded_source
    };
@@ -90,7 +93,10 @@ fn open_local_source(path: &Path, start_time: Duration) -> Result<BoxedSource> {
    Ok(Box::new(decoder))
 }
 
-fn open_remote_source(remote: &RemoteSourceDescriptor, start_time: Duration) -> Result<BoxedSource> {
+fn open_remote_source(
+   remote: &RemoteSourceDescriptor,
+   start_time: Duration,
+) -> Result<BoxedSource> {
    let decoder = build_decoder(
       BufReader::new(HttpAudioReader::new(remote.url.clone(), remote.byte_len)),
       remote.byte_len,
