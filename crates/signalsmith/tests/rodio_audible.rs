@@ -9,6 +9,7 @@ use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 use signalsmith::PlaybackStream;
 
 const SOURCE_DURATION_SECONDS: usize = 5;
+const RESTART_FADE_MILLISECONDS: u32 = 100;
 const OUTPUT_BLOCK_FRAMES: usize = 512;
 const FLUSH_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 4;
 
@@ -34,6 +35,10 @@ fn open_fixture_decoder() -> Result<FixtureDecoder, Box<dyn Error>> {
 
 fn preview_source_frames(sample_rate_hz: u32) -> usize {
    sample_rate_hz as usize * SOURCE_DURATION_SECONDS
+}
+
+fn restart_fade_frames(sample_rate_hz: NonZeroU32) -> usize {
+   ((sample_rate_hz.get() as u64 * RESTART_FADE_MILLISECONDS as u64) / 1000) as usize
 }
 
 fn available_source_frames(total_duration: Option<Duration>, sample_rate_hz: u32) -> Option<usize> {
@@ -64,9 +69,8 @@ struct StreamingPlaybackSource {
    output_index: usize,
    current_input_frame: usize,
    current_segment_end_frame: usize,
-   pending_seek_frame: Option<usize>,
-   final_end_frame: usize,
-   trim_frames_remaining: usize,
+   fade_in_samples_remaining: usize,
+   fade_in_samples_total: usize,
    flushed: bool,
    ended: bool,
 }
@@ -78,15 +82,12 @@ impl StreamingPlaybackSource {
       sample_rate_hz: NonZeroU32,
       playback_rate: f32,
       current_segment_end_frame: usize,
-      pending_seek_frame: Option<usize>,
-      final_end_frame: usize,
    ) -> Self {
       let stream = PlaybackStream::with_rate(
          usize::from(channels.get()),
          sample_rate_hz.get() as f32,
          playback_rate,
       );
-      let trim_frames_remaining = stream.output_latency() * 2;
 
       Self {
          input,
@@ -98,12 +99,19 @@ impl StreamingPlaybackSource {
          output_index: 0,
          current_input_frame: 0,
          current_segment_end_frame,
-         pending_seek_frame,
-         final_end_frame,
-         trim_frames_remaining,
+         fade_in_samples_remaining: 0,
+         fade_in_samples_total: 0,
          flushed: false,
          ended: false,
       }
+   }
+
+   fn with_fade_in_frames(mut self, frame_count: usize) -> Self {
+      let fade_in_samples = frame_count * self.channel_count();
+
+      self.fade_in_samples_remaining = fade_in_samples;
+      self.fade_in_samples_total = fade_in_samples;
+      self
    }
 
    fn channel_count(&self) -> usize {
@@ -132,13 +140,12 @@ impl StreamingPlaybackSource {
       self.current_input_frame += input_frames;
    }
 
-   fn perform_pending_seek(&mut self, seek_frame: usize) -> Result<(), RodioSeekError> {
+   fn seek_to_frame(&mut self, seek_frame: usize) -> Result<(), RodioSeekError> {
       self.input.try_seek(Duration::from_secs_f64(
          seek_frame as f64 / self.sample_rate_hz.get() as f64,
       ))?;
 
       self.current_input_frame = seek_frame;
-      self.current_segment_end_frame = self.final_end_frame;
       self.flushed = false;
       self.ended = false;
       self.clear_output_buffer();
@@ -172,19 +179,8 @@ impl StreamingPlaybackSource {
 
       self.clear_output_buffer();
 
-      loop {
-         if self.current_input_frame >= self.current_segment_end_frame {
-            if let Some(seek_frame) = self.pending_seek_frame.take() {
-               self
-                  .perform_pending_seek(seek_frame)
-                  .unwrap_or_else(|error| panic!("failed to seek audible source: {error}"));
-               continue;
-            }
-
-            return self.flush_output();
-         }
-
-         break;
+      if self.current_input_frame >= self.current_segment_end_frame {
+         return self.flush_output();
       }
 
       let remaining_frames = self.current_segment_end_frame - self.current_input_frame;
@@ -208,34 +204,12 @@ impl StreamingPlaybackSource {
       assert_eq!(consumed, input_frames);
       true
    }
-
-   fn discard_initial_trim(&mut self) -> bool {
-      while self.trim_frames_remaining > 0 {
-         if self.output_index >= self.output_buffer.len() && !self.refill_output_buffer() {
-            return false;
-         }
-
-         let available_frames =
-            (self.output_buffer.len() - self.output_index) / self.channel_count();
-         let discard_frames = available_frames.min(self.trim_frames_remaining);
-
-         self.output_index += discard_frames * self.channel_count();
-         self.trim_frames_remaining -= discard_frames;
-      }
-
-      true
-   }
 }
 
 impl Iterator for StreamingPlaybackSource {
    type Item = f32;
 
    fn next(&mut self) -> Option<Self::Item> {
-      if !self.discard_initial_trim() {
-         self.ended = true;
-         return None;
-      }
-
       while self.output_index >= self.output_buffer.len() {
          if !self.refill_output_buffer() {
             self.ended = true;
@@ -250,7 +224,17 @@ impl Iterator for StreamingPlaybackSource {
 
       let sample = self.output_buffer.get(self.output_index).copied();
       self.output_index += 1;
-      sample
+
+      sample.map(|value| {
+         if self.fade_in_samples_remaining == 0 || self.fade_in_samples_total == 0 {
+            return value;
+         }
+
+         let emitted_samples = self.fade_in_samples_total - self.fade_in_samples_remaining;
+         self.fade_in_samples_remaining -= 1;
+
+         value * (emitted_samples as f32 / self.fade_in_samples_total as f32)
+      })
    }
 }
 
@@ -303,8 +287,6 @@ fn play_fixture_at_rate(playback_rate: f32) -> Result<(), Box<dyn Error>> {
       sample_rate_hz,
       playback_rate,
       source_frames,
-      None,
-      source_frames,
    ))
 }
 
@@ -314,7 +296,7 @@ fn play_fixture_at_rate_with_seek(
    seek_seconds: usize,
    second_segment_end_seconds: usize,
 ) -> Result<(), Box<dyn Error>> {
-   let (input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+   let (first_input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
    let source_frames = preview_source_frames(sample_rate_hz.get());
    let first_segment_end_frames = sample_rate_hz.get() as usize * first_segment_end_seconds;
    let seek_frame = sample_rate_hz.get() as usize * seek_seconds;
@@ -344,14 +326,25 @@ fn play_fixture_at_rate_with_seek(
    );
 
    play_streaming_audio(StreamingPlaybackSource::new(
-      input,
+      first_input,
       channels,
       sample_rate_hz,
       playback_rate,
       first_segment_end_frames,
-      Some(seek_frame),
+   ))?;
+
+   let (second_input, second_channels, second_sample_rate_hz, _) = open_fixture_decoder()?;
+   let mut second_source = StreamingPlaybackSource::new(
+      second_input,
+      second_channels,
+      second_sample_rate_hz,
+      playback_rate,
       second_segment_end_frame,
-   ))
+   )
+   .with_fade_in_frames(restart_fade_frames(second_sample_rate_hz));
+
+   second_source.seek_to_frame(seek_frame)?;
+   play_streaming_audio(second_source)
 }
 
 #[test]
