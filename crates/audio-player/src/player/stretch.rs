@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rodio::source::SeekError as RodioSeekError;
 use rodio::{Sample, Source};
-use signalsmith_rust::PlaybackStream;
+use signalsmith::PlaybackStream;
 
 const OUTPUT_CHUNK_FRAMES: usize = 2048;
 

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
-use rodio::{Player, Sample, Source};
+use rodio::{Player};
 use tracing::warn;
 
 use self::source::{SourceDescriptor, load_source_descriptor, open_source_at};
