@@ -1,0 +1,12 @@
+[package]
+name = "signalsmith"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.89"
+description = "Partial Rust port of signalsmith-stretch audio time stretching library"
+
+[dependencies]
+
+[dev-dependencies]
+rodio = "0.22.2"

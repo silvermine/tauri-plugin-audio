@@ -9,7 +9,7 @@ rust-version = "1.89"
 [dependencies]
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-flac", "symphonia-isomp4", "symphonia-mp3", "symphonia-ogg", "symphonia-pcm", "symphonia-vorbis", "symphonia-wav"] }
 serde = { version = "1.0.228", features = ["derive"] }
-signalsmith-rust = { path = "../../../signalsmith-rust" }
+signalsmith = { path = "../signalsmith" }
 thiserror = "2.0.17"
 tracing = { version = "0.1.41", default-features = false, features = ["std", "log"] }
 ureq = "2.12.1"
