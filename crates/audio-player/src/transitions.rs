@@ -39,12 +39,7 @@ pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> R
 
 /// Finalizes prepare by transitioning from `Loading` to `Ready` with the
 /// decoded duration.
-pub fn load(
-   state: &mut PlayerState,
-   src: &str,
-   meta: &AudioMetadata,
-   duration: f64,
-) -> Result<()> {
+pub fn load(state: &mut PlayerState, src: &str, meta: &AudioMetadata, duration: f64) -> Result<()> {
    match state.status {
       PlaybackStatus::Loading => {}
       _ => {
