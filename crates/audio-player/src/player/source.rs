@@ -11,6 +11,12 @@ use super::stretch::StretchSource;
 use crate::error::{Error, Result};
 use crate::net::reject_private_host;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeekStrategy {
+   Direct,
+   Reopen,
+}
+
 #[derive(Clone)]
 pub(crate) enum SourceDescriptor {
    Local { path: PathBuf },
@@ -22,7 +28,7 @@ pub(crate) type BoxedSource = Box<dyn Source<Item = Sample> + Send>;
 pub(crate) struct OpenedSource {
    pub(crate) source: BoxedSource,
    pub(crate) duration: f64,
-   pub(crate) supports_direct_seek: bool,
+   pub(crate) seek_strategy: SeekStrategy,
 }
 
 pub(crate) fn load_source_descriptor(src: &str) -> Result<SourceDescriptor> {
@@ -47,8 +53,13 @@ pub(crate) fn open_source_at(
    position: f64,
    playback_rate: f64,
 ) -> Result<OpenedSource> {
-   let supports_direct_seek = matches!(source, SourceDescriptor::Local { .. })
-      && (playback_rate - 1.0).abs() <= f64::EPSILON;
+   let seek_strategy = if matches!(source, SourceDescriptor::Local { .. })
+      && (playback_rate - 1.0).abs() <= f64::EPSILON
+   {
+      SeekStrategy::Direct
+   } else {
+      SeekStrategy::Reopen
+   };
    let decoded_source = open_decoded_source(source, Duration::from_secs_f64(position.max(0.0)))?;
    let duration = decoded_source
       .total_duration()
@@ -63,7 +74,7 @@ pub(crate) fn open_source_at(
    Ok(OpenedSource {
       source,
       duration,
-      supports_direct_seek,
+      seek_strategy,
    })
 }
 
