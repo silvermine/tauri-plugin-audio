@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::Duration;
 
-use rodio::source::SeekError as RodioSeekError;
 use rodio::{Sample, Source};
 use signalsmith::PlaybackStream;
 
@@ -81,23 +79,6 @@ impl StretchSource {
       }
 
       self.input_buffer.len() / self.channel_count()
-   }
-
-   fn read_exact_input_frames(
-      &mut self,
-      frame_count: usize,
-      context: &str,
-   ) -> std::result::Result<(), RodioSeekError> {
-      let input_frames = self.read_up_to_input_frames(frame_count);
-
-      if input_frames == frame_count {
-         return Ok(());
-      }
-
-      Err(RodioSeekError::Other(Arc::new(std::io::Error::new(
-         std::io::ErrorKind::UnexpectedEof,
-         format!("Audio source ended during {context}"),
-      ))))
    }
 
    fn flush_output(&mut self) -> bool {
@@ -202,29 +183,6 @@ impl Source for StretchSource {
 
    fn total_duration(&self) -> Option<Duration> {
       self.total_duration
-   }
-
-   fn try_seek(&mut self, position: Duration) -> std::result::Result<(), RodioSeekError> {
-      self.input.try_seek(position).map_err(|error| {
-         RodioSeekError::Other(Arc::new(std::io::Error::other(error.to_string())))
-      })?;
-
-      self.stream.reset();
-      self.flushed = false;
-      self.ended = false;
-      self.clear_output_buffer();
-      self.pending_input_buffer.clear();
-      self.input_buffer.clear();
-
-      let seek_input_frames = self.stream.output_seek_length();
-
-      if seek_input_frames > 0 {
-         self.read_exact_input_frames(seek_input_frames, "seek warmup")?;
-         self.stream.output_seek_interleaved(&self.input_buffer);
-         self.input_buffer.clear();
-      }
-
-      Ok(())
    }
 }
 
