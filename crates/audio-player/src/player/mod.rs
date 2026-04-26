@@ -263,7 +263,6 @@ impl RodioAudioPlayer {
          Complete(PlayerState),
          Reopen {
             source_descriptor: SourceDescriptor,
-            duration: f64,
             target_time: f64,
             previous_time: f64,
             seek_generation: u64,
@@ -279,10 +278,10 @@ impl RodioAudioPlayer {
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let seek_generation = inner.seek_generation;
 
-         let action = if let Some((source_descriptor, duration, seek_strategy)) = inner
+         let action = if let Some((source_descriptor, seek_strategy)) = inner
             .playback
             .as_ref()
-            .map(|ctx| (ctx.source.clone(), ctx.duration, ctx.seek_strategy))
+            .map(|ctx| (ctx.source.clone(), ctx.seek_strategy))
          {
             if matches!(seek_strategy, SeekStrategy::Direct) {
                Self::seek_local_playback(&mut inner, &source_descriptor, was_ended, previous_time)?;
@@ -295,7 +294,6 @@ impl RodioAudioPlayer {
 
                SeekAction::Reopen {
                   source_descriptor,
-                  duration,
                   target_time: inner.state.current_time,
                   previous_time,
                   seek_generation,
@@ -309,7 +307,6 @@ impl RodioAudioPlayer {
             SeekAction::Complete(snapshot) => snapshot,
             SeekAction::Reopen {
                source_descriptor,
-               duration,
                target_time,
                previous_time,
                seek_generation,
@@ -317,7 +314,6 @@ impl RodioAudioPlayer {
                drop(inner);
                self.reopen_playback_at(
                   source_descriptor,
-                  duration,
                   target_time,
                   previous_time,
                   seek_generation,
@@ -334,7 +330,6 @@ impl RodioAudioPlayer {
    fn reopen_playback_at(
       &self,
       source_descriptor: SourceDescriptor,
-      duration: f64,
       target_time: f64,
       previous_time: f64,
       seek_generation: u64,
@@ -368,6 +363,8 @@ impl RodioAudioPlayer {
 
       let sink = Player::connect_new(self.output_sink.mixer());
       sink.pause();
+      let duration = opened_source.duration;
+      let seek_strategy = opened_source.seek_strategy;
       sink.append(opened_source.source);
 
       let mut inner = lock_inner(&self.inner);
@@ -384,7 +381,7 @@ impl RodioAudioPlayer {
          source: source_descriptor,
          duration,
          position_offset: target_time,
-         seek_strategy: opened_source.seek_strategy,
+         seek_strategy,
       }) {
          previous_playback.sink.stop();
       }
@@ -474,7 +471,6 @@ impl RodioAudioPlayer {
          Complete(PlayerState),
          Reopen {
             source_descriptor: SourceDescriptor,
-            duration: f64,
             target_time: f64,
             previous_time: f64,
             seek_generation: u64,
@@ -487,10 +483,10 @@ impl RodioAudioPlayer {
 
          transitions::set_playback_rate(&mut inner.state, rate)?;
 
-         if let Some((source_descriptor, duration)) = inner
+         if let Some(source_descriptor) = inner
             .playback
             .as_ref()
-            .map(|ctx| (ctx.source.clone(), ctx.duration))
+            .map(|ctx| ctx.source.clone())
          {
             inner.seek_generation = inner.seek_generation.wrapping_add(1);
             let seek_generation = inner.seek_generation;
@@ -502,7 +498,6 @@ impl RodioAudioPlayer {
 
             PlaybackRateAction::Reopen {
                source_descriptor,
-               duration,
                target_time: inner.state.current_time,
                previous_time,
                seek_generation,
@@ -516,13 +511,11 @@ impl RodioAudioPlayer {
          PlaybackRateAction::Complete(snapshot) => snapshot,
          PlaybackRateAction::Reopen {
             source_descriptor,
-            duration,
             target_time,
             previous_time,
             seek_generation,
          } => self.reopen_playback_at(
             source_descriptor,
-            duration,
             target_time,
             previous_time,
             seek_generation,
