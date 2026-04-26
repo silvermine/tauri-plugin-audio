@@ -10,7 +10,7 @@ use rodio::Player;
 use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
 use tracing::warn;
 
-use self::source::{SourceDescriptor, load_source_descriptor, open_source_at};
+use self::source::{SeekStrategy, SourceDescriptor, load_source_descriptor, open_source_at};
 
 use crate::error::{Error, Result};
 use crate::models::{AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerState, TimeUpdate};
@@ -41,7 +41,7 @@ struct PlaybackContext {
    source: SourceDescriptor,
    duration: f64,
    position_offset: f64,
-   supports_direct_seek: bool,
+   seek_strategy: SeekStrategy,
 }
 
 impl RodioAudioPlayer {
@@ -176,7 +176,7 @@ impl RodioAudioPlayer {
          source: descriptor,
          duration,
          position_offset: 0.0,
-         supports_direct_seek: opened_source.supports_direct_seek,
+         seek_strategy: opened_source.seek_strategy,
       });
 
       Ok(inner.state.clone())
@@ -197,7 +197,7 @@ impl RodioAudioPlayer {
             ctx.sink.append(opened_source.source);
             ctx.sink.pause();
             ctx.position_offset = 0.0;
-            ctx.supports_direct_seek = opened_source.supports_direct_seek;
+            ctx.seek_strategy = opened_source.seek_strategy;
             replayed_from_start = true;
          }
 
@@ -279,12 +279,12 @@ impl RodioAudioPlayer {
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let seek_generation = inner.seek_generation;
 
-         let action = if let Some((source_descriptor, duration, supports_direct_seek)) = inner
+         let action = if let Some((source_descriptor, duration, seek_strategy)) = inner
             .playback
             .as_ref()
-            .map(|ctx| (ctx.source.clone(), ctx.duration, ctx.supports_direct_seek))
+            .map(|ctx| (ctx.source.clone(), ctx.duration, ctx.seek_strategy))
          {
-            if supports_direct_seek {
+            if matches!(seek_strategy, SeekStrategy::Direct) {
                Self::seek_local_playback(&mut inner, &source_descriptor, was_ended, previous_time)?;
                SeekAction::Complete(inner.state.clone())
             } else {
@@ -384,7 +384,7 @@ impl RodioAudioPlayer {
          source: source_descriptor,
          duration,
          position_offset: target_time,
-         supports_direct_seek: opened_source.supports_direct_seek,
+         seek_strategy: opened_source.seek_strategy,
       }) {
          previous_playback.sink.stop();
       }
@@ -421,7 +421,7 @@ impl RodioAudioPlayer {
          };
          ctx.sink.append(opened_source.source);
          ctx.sink.pause();
-         ctx.supports_direct_seek = opened_source.supports_direct_seek;
+         ctx.seek_strategy = opened_source.seek_strategy;
          reopened_source = true;
       }
 
@@ -593,7 +593,7 @@ fn monitor_loop(
                   Ok(source) => {
                      ctx.sink.append(source.source);
                      ctx.position_offset = 0.0;
-                     ctx.supports_direct_seek = source.supports_direct_seek;
+                     ctx.seek_strategy = source.seek_strategy;
                   }
                   Err(e) => warn!("Failed to reopen loop source: {e}"),
                }
