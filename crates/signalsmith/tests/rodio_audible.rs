@@ -2,14 +2,15 @@ use std::error::Error;
 use std::fs::File;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::PathBuf;
+use std::thread;
 use std::time::Duration;
 
+use rodio::source::Zero;
 use rodio::source::SeekError as RodioSeekError;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 use signalsmith::PlaybackStream;
 
 const SOURCE_DURATION_SECONDS: usize = 5;
-const RESTART_FADE_MILLISECONDS: u32 = 100;
 const OUTPUT_BLOCK_FRAMES: usize = 512;
 const FLUSH_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 4;
 
@@ -35,10 +36,6 @@ fn open_fixture_decoder() -> Result<FixtureDecoder, Box<dyn Error>> {
 
 fn preview_source_frames(sample_rate_hz: u32) -> usize {
    sample_rate_hz as usize * SOURCE_DURATION_SECONDS
-}
-
-fn restart_fade_frames(sample_rate_hz: NonZeroU32) -> usize {
-   ((sample_rate_hz.get() as u64 * RESTART_FADE_MILLISECONDS as u64) / 1000) as usize
 }
 
 fn available_source_frames(total_duration: Option<Duration>, sample_rate_hz: u32) -> Option<usize> {
@@ -69,8 +66,6 @@ struct StreamingPlaybackSource {
    output_index: usize,
    current_input_frame: usize,
    current_segment_end_frame: usize,
-   fade_in_samples_remaining: usize,
-   fade_in_samples_total: usize,
    flushed: bool,
    ended: bool,
 }
@@ -99,19 +94,9 @@ impl StreamingPlaybackSource {
          output_index: 0,
          current_input_frame: 0,
          current_segment_end_frame,
-         fade_in_samples_remaining: 0,
-         fade_in_samples_total: 0,
          flushed: false,
          ended: false,
       }
-   }
-
-   fn with_fade_in_frames(mut self, frame_count: usize) -> Self {
-      let fade_in_samples = frame_count * self.channel_count();
-
-      self.fade_in_samples_remaining = fade_in_samples;
-      self.fade_in_samples_total = fade_in_samples;
-      self
    }
 
    fn channel_count(&self) -> usize {
@@ -225,22 +210,20 @@ impl Iterator for StreamingPlaybackSource {
       let sample = self.output_buffer.get(self.output_index).copied();
       self.output_index += 1;
 
-      sample.map(|value| {
-         if self.fade_in_samples_remaining == 0 || self.fade_in_samples_total == 0 {
-            return value;
-         }
-
-         let emitted_samples = self.fade_in_samples_total - self.fade_in_samples_remaining;
-         self.fade_in_samples_remaining -= 1;
-
-         value * (emitted_samples as f32 / self.fade_in_samples_total as f32)
-      })
+      sample
    }
 }
 
 impl Source for StreamingPlaybackSource {
    fn current_span_len(&self) -> Option<usize> {
       if self.ended { Some(0) } else { None }
+   }
+
+   fn try_seek(&mut self, position: Duration) -> Result<(), RodioSeekError> {
+      let seek_frame = ((position.as_secs_f64() * self.sample_rate_hz.get() as f64).floor() as usize)
+         .min(self.current_segment_end_frame);
+
+      self.seek_to_frame(seek_frame)
    }
 
    fn channels(&self) -> NonZeroU16 {
@@ -264,6 +247,12 @@ fn play_streaming_audio(source: StreamingPlaybackSource) -> Result<(), Box<dyn E
    player.sleep_until_end();
 
    Ok(())
+}
+
+fn wait_for_played_source_seconds(playback_rate: f32, source_seconds: f64) {
+   thread::sleep(Duration::from_secs_f64(
+      source_seconds / playback_rate as f64,
+   ));
 }
 
 fn play_fixture_at_rate(playback_rate: f32) -> Result<(), Box<dyn Error>> {
@@ -340,34 +329,264 @@ fn play_fixture_at_rate_with_seek(
       second_sample_rate_hz,
       playback_rate,
       second_segment_end_frame,
-   )
-   .with_fade_in_frames(restart_fade_frames(second_sample_rate_hz));
+   );
 
    second_source.seek_to_frame(seek_frame)?;
    play_streaming_audio(second_source)
 }
 
+fn play_fixture_at_rate_with_direct_seek(
+   playback_rate: f32,
+   first_segment_end_seconds: usize,
+   seek_seconds: usize,
+   second_segment_end_seconds: usize,
+) -> Result<(), Box<dyn Error>> {
+   let (input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+   let preview_frames = preview_source_frames(sample_rate_hz.get());
+   let available_frames = available_source_frames(total_duration, sample_rate_hz.get())
+      .unwrap_or(preview_frames);
+   let first_segment_end_frames = sample_rate_hz.get() as usize * first_segment_end_seconds;
+   let second_segment_end_frame = sample_rate_hz.get() as usize * second_segment_end_seconds;
+
+   assert!(
+      channels.get() > 0,
+      "fixture WAV must have at least one channel"
+   );
+   assert!(
+      first_segment_end_frames < available_frames,
+      "direct seek must happen before the source ends"
+   );
+   assert!(
+      seek_seconds < second_segment_end_seconds,
+      "seek must land before the final segment end"
+   );
+   assert!(
+      second_segment_end_frame <= available_frames,
+      "second segment exceeds fixture length"
+   );
+
+   let sink = DeviceSinkBuilder::open_default_sink()?;
+   let player = Player::connect_new(sink.mixer());
+
+   player.append(StreamingPlaybackSource::new(
+      input,
+      channels,
+      sample_rate_hz,
+      playback_rate,
+      available_frames,
+   ));
+
+   wait_for_played_source_seconds(playback_rate, first_segment_end_seconds as f64);
+   player.try_seek(Duration::from_secs_f64(seek_seconds as f64))?;
+   wait_for_played_source_seconds(
+      playback_rate,
+      (second_segment_end_seconds - seek_seconds) as f64,
+   );
+   player.stop();
+
+   Ok(())
+}
+
+fn play_fixture_at_rate_with_pause_and_resume(
+   playback_rate: f32,
+   played_seconds: usize,
+   paused_seconds: usize,
+   source_duration_seconds: usize,
+) -> Result<(), Box<dyn Error>> {
+   let (input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+   let source_frames = sample_rate_hz.get() as usize * source_duration_seconds;
+
+   assert!(
+      channels.get() > 0,
+      "fixture WAV must have at least one channel"
+   );
+   assert!(
+      played_seconds < source_duration_seconds,
+      "pause point must land before the source ends"
+   );
+   assert_fixture_length(
+      total_duration,
+      sample_rate_hz,
+      source_frames,
+      "resume preview length",
+   );
+
+   let sink = DeviceSinkBuilder::open_default_sink()?;
+   let player = Player::connect_new(sink.mixer());
+
+   player.append(StreamingPlaybackSource::new(
+      input,
+      channels,
+      sample_rate_hz,
+      playback_rate,
+      source_frames,
+   ));
+
+   wait_for_played_source_seconds(playback_rate, played_seconds as f64);
+   player.pause();
+   thread::sleep(Duration::from_secs(paused_seconds as u64));
+   player.play();
+   player.sleep_until_end();
+
+   Ok(())
+}
+
+fn play_fixture_at_rate_with_pause_and_reopened_resume(
+   playback_rate: f32,
+   played_seconds: usize,
+   paused_seconds: usize,
+   source_duration_seconds: usize,
+) -> Result<(), Box<dyn Error>> {
+   let (first_input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+   let source_frames = sample_rate_hz.get() as usize * source_duration_seconds;
+   let seek_frame = sample_rate_hz.get() as usize * played_seconds;
+
+   assert!(
+      channels.get() > 0,
+      "fixture WAV must have at least one channel"
+   );
+   assert!(
+      played_seconds < source_duration_seconds,
+      "pause point must land before the source ends"
+   );
+   assert_fixture_length(
+      total_duration,
+      sample_rate_hz,
+      source_frames,
+      "resume preview length",
+   );
+
+   play_streaming_audio(StreamingPlaybackSource::new(
+      first_input,
+      channels,
+      sample_rate_hz,
+      playback_rate,
+      seek_frame,
+   ))?;
+
+   thread::sleep(Duration::from_secs(paused_seconds as u64));
+
+   let (second_input, second_channels, second_sample_rate_hz, _) = open_fixture_decoder()?;
+   let mut second_source = StreamingPlaybackSource::new(
+      second_input,
+      second_channels,
+      second_sample_rate_hz,
+      playback_rate,
+      source_frames,
+   );
+
+   second_source.seek_to_frame(seek_frame)?;
+   play_streaming_audio(second_source)
+}
+
+fn play_fixture_at_rate_with_silence_and_resume(
+   playback_rate: f32,
+   played_seconds: usize,
+   silence_seconds: usize,
+   source_duration_seconds: usize,
+) -> Result<(), Box<dyn Error>> {
+   let (input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+   let source_frames = sample_rate_hz.get() as usize * source_duration_seconds;
+
+   assert!(
+      channels.get() > 0,
+      "fixture WAV must have at least one channel"
+   );
+   assert!(
+      played_seconds < source_duration_seconds,
+      "resume point must land before the source ends"
+   );
+   assert_fixture_length(
+      total_duration,
+      sample_rate_hz,
+      source_frames,
+      "resume preview length",
+   );
+
+   let sink = DeviceSinkBuilder::open_default_sink()?;
+   let player = Player::connect_new(sink.mixer());
+
+   player.append(StreamingPlaybackSource::new(
+      input,
+      channels,
+      sample_rate_hz,
+      playback_rate,
+      source_frames,
+   ));
+
+   wait_for_played_source_seconds(playback_rate, played_seconds as f64);
+   player.pause();
+
+   let silence_player = Player::connect_new(sink.mixer());
+   silence_player.append(
+      Zero::new(channels, sample_rate_hz)
+         .take_duration(Duration::from_secs(silence_seconds as u64)),
+   );
+   silence_player.sleep_until_end();
+
+   player.play();
+   player.sleep_until_end();
+
+   Ok(())
+}
+
+// Play - no clicks
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn plays_fixture_at_zero_point_seven_five_x() -> Result<(), Box<dyn Error>> {
+fn play_supports_slower_playback_rate() -> Result<(), Box<dyn Error>> {
    play_fixture_at_rate(0.75)
 }
 
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn plays_fixture_at_one_point_two_five_x() -> Result<(), Box<dyn Error>> {
+fn play_supports_fractional_faster_playback_rate() -> Result<(), Box<dyn Error>> {
    play_fixture_at_rate(1.25)
 }
 
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn plays_fixture_at_one_point_two_five_x_with_seek_from_five_seconds_to_two_seconds()
+fn play_supports_significantly_faster_playback_rate() -> Result<(), Box<dyn Error>> {
+   play_fixture_at_rate(2.0)
+}
+
+// Seek
+#[test]
+#[ignore = "manual audible check; plays rendered output through rodio"]
+fn seek_supports_direct_seek_during_playback()
 -> Result<(), Box<dyn Error>> {
-   play_fixture_at_rate_with_seek(1.25, 5, 2, 5)
+   // clicks
+   play_fixture_at_rate_with_direct_seek(1.25, 4, 2, SOURCE_DURATION_SECONDS)
 }
 
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn plays_fixture_at_two_x() -> Result<(), Box<dyn Error>> {
-   play_fixture_at_rate(2.0)
+fn seek_supports_reopened_source_seek()
+-> Result<(), Box<dyn Error>> {
+   // no click
+   play_fixture_at_rate_with_seek(1.25, 4, 2, SOURCE_DURATION_SECONDS)
+}
+
+// Resume
+#[test]
+#[ignore = "manual audible check; plays rendered output through rodio"]
+fn resume_continues_after_pause()
+-> Result<(), Box<dyn Error>> {
+   // clicks
+   play_fixture_at_rate_with_pause_and_resume(1.25, 3, 5, SOURCE_DURATION_SECONDS)
+}
+
+#[test]
+#[ignore = "manual audible check; plays rendered output through rodio"]
+fn resume_continues_after_reopening_source()
+-> Result<(), Box<dyn Error>> {
+   // clicks
+   play_fixture_at_rate_with_pause_and_reopened_resume(1.25, 3, 5, SOURCE_DURATION_SECONDS)
+}
+
+#[test]
+#[ignore = "manual audible check; plays rendered output through rodio"]
+fn resume_continues_after_silence_gap()
+-> Result<(), Box<dyn Error>> {
+   // sometimes clicks
+   play_fixture_at_rate_with_silence_and_resume(1.25, 3, 5, SOURCE_DURATION_SECONDS)
 }
