@@ -96,7 +96,7 @@ pub struct TimeUpdate {
    pub duration: f64,
 }
 
-/// Response from a transport action (load, play, pause, stop, seek).
+/// Response from a transport action (prepare, play, pause, stop, seek).
 ///
 /// Wraps the resulting [`PlayerState`] with status-expectation metadata so the
 /// TypeScript layer can detect unexpected state transitions.

@@ -14,7 +14,7 @@ use crate::models::{AudioMetadata, PlaybackStatus, PlayerState};
 /// Transitions to [`PlaybackStatus::Loading`] and stores metadata.
 ///
 /// Call this before starting I/O so the frontend can show a loading indicator.
-/// After the I/O completes, call [`load`] to finalize the transition to `Ready`.
+/// After the I/O completes, call [`prepare`] to finalize the transition to `Ready`.
 pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> Result<()> {
    match state.status {
       PlaybackStatus::Idle | PlaybackStatus::Ended | PlaybackStatus::Error => {}
@@ -37,15 +37,11 @@ pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> R
    Ok(())
 }
 
-/// Finalizes a load by transitioning from `Loading` to `Ready` with the
-/// decoded duration. Also accepts `Idle`, `Ended`, and `Error` in case
-/// `begin_load` was skipped (e.g. instant local file loads).
+/// Finalizes prepare by transitioning from `Loading` to `Ready` with the
+/// decoded duration.
 pub fn load(state: &mut PlayerState, src: &str, meta: &AudioMetadata, duration: f64) -> Result<()> {
    match state.status {
-      PlaybackStatus::Loading
-      | PlaybackStatus::Idle
-      | PlaybackStatus::Ended
-      | PlaybackStatus::Error => {}
+      PlaybackStatus::Loading => {}
       _ => {
          return Err(Error::InvalidState(format!(
             "Cannot load in {:?} state",
@@ -139,14 +135,18 @@ pub fn seek(state: &mut PlayerState, position: f64) -> Result<()> {
          )));
       }
    }
-   state.current_time = position.clamp(0.0, state.duration);
+   state.current_time = if state.duration.is_finite() && state.duration > 0.0 {
+      position.clamp(0.0, state.duration)
+   } else {
+      position.max(0.0)
+   };
    Ok(())
 }
 
 /// Transitions to [`PlaybackStatus::Error`] with a message.
 ///
-/// Valid from `Loading` (I/O or decode failure during load). Other statuses are
-/// left unchanged — callers should only invoke this when a load operation fails
+/// Valid from `Loading` (I/O or decode failure during prepare). Other statuses are
+/// left unchanged — callers should only invoke this when a prepare operation fails
 /// after `begin_load` has already moved the state to `Loading`.
 pub fn error(state: &mut PlayerState, message: String) {
    if state.status == PlaybackStatus::Loading {
@@ -272,7 +272,7 @@ mod tests {
       assert!(begin_load(&mut s, "a.mp3", &AudioMetadata::default()).is_err());
    }
 
-   // -- load (finalize) --
+   // -- prepare (finalize) --
 
    #[test]
    fn load_from_loading() {
@@ -288,24 +288,21 @@ mod tests {
    }
 
    #[test]
-   fn load_from_idle() {
+   fn load_rejected_from_idle() {
       let mut s = state_with_status(PlaybackStatus::Idle);
-      load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).unwrap();
-      assert_eq!(s.status, PlaybackStatus::Ready);
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
-   fn load_from_ended() {
+   fn load_rejected_from_ended() {
       let mut s = state_with_status(PlaybackStatus::Ended);
-      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_ok());
-      assert_eq!(s.status, PlaybackStatus::Ready);
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
-   fn load_from_error() {
+   fn load_rejected_from_error() {
       let mut s = state_with_status(PlaybackStatus::Error);
-      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_ok());
-      assert_eq!(s.status, PlaybackStatus::Ready);
+      assert!(load(&mut s, "a.mp3", &AudioMetadata::default(), 0.0).is_err());
    }
 
    #[test]
@@ -539,6 +536,16 @@ mod tests {
       let mut s = state_with_duration(PlaybackStatus::Playing, 120.0);
       seek(&mut s, 999.0).unwrap();
       assert_eq!(s.current_time, 120.0);
+   }
+
+   #[test]
+   fn seek_does_not_clamp_when_duration_unknown() {
+      let mut s = state_with_duration(PlaybackStatus::Ready, 0.0);
+      seek(&mut s, 45.0).unwrap();
+      assert_eq!(s.current_time, 45.0);
+
+      seek(&mut s, -5.0).unwrap();
+      assert_eq!(s.current_time, 0.0);
    }
 
    #[test]
