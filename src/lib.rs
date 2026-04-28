@@ -9,19 +9,20 @@ use tracing::warn;
 mod commands;
 
 pub use audio_player::{
-   AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerState, TimeUpdate,
+   AudioActionResponse, AudioMetadata, LoopMode, PlaybackStatus, PlayerState, PlaylistItem,
+   TimeUpdate,
 };
 pub use audio_player::{Error, OnChanged, OnTimeUpdate, Result, RodioAudioPlayer};
 
 /// Extensions to [`tauri::App`], [`tauri::AppHandle`] and [`tauri::Window`] to access
 /// the audio player APIs.
 pub trait AudioExt<R: Runtime> {
-   fn audio(&self) -> &RodioAudioPlayer;
+   fn audio(&self) -> Arc<RodioAudioPlayer>;
 }
 
 impl<R: Runtime, T: Manager<R>> AudioExt<R> for T {
-   fn audio(&self) -> &RodioAudioPlayer {
-      self.state::<RodioAudioPlayer>().inner()
+   fn audio(&self) -> Arc<RodioAudioPlayer> {
+      Arc::clone(self.state::<Arc<RodioAudioPlayer>>().inner())
    }
 }
 
@@ -37,10 +38,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
          commands::pause,
          commands::stop,
          commands::seek,
+         commands::next,
+         commands::prev,
+         commands::jump_to,
          commands::set_volume,
          commands::set_muted,
          commands::set_playback_rate,
-         commands::set_loop,
+         commands::set_loop_mode,
          commands::get_state,
          commands::is_native,
       ])

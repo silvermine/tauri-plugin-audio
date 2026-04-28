@@ -19,17 +19,13 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
  */
 export enum PlaybackStatus {
 
-   /** No audio source is loaded. */
+   /** No playlist is loaded. */
    Idle = 'idle',
 
-   /**
-    * An audio source is being loaded. Reserved for the real implementation
-    * where loading is asynchronous. The mock transitions directly from
-    * Idle to Ready.
-    */
+   /** A playlist item is being fetched or decoded. */
    Loading = 'loading',
 
-   /** Audio source is loaded and ready to play. */
+   /** Current item is loaded and ready to play. */
    Ready = 'ready',
 
    /** Audio is currently playing. */
@@ -38,7 +34,7 @@ export enum PlaybackStatus {
    /** Audio playback is paused. */
    Paused = 'paused',
 
-   /** Audio playback has reached the end. */
+   /** Reached the end of the playlist with looping disabled. */
    Ended = 'ended',
 
    /** An error occurred during loading or playback. */
@@ -57,10 +53,26 @@ export enum AudioAction {
    Pause = 'pause',
    Stop = 'stop',
    Seek = 'seek',
+   Next = 'next',
+   Prev = 'prev',
+   JumpTo = 'jumpTo',
 }
 
 /**
- * Metadata for the audio source, used for OS transport control integration
+ * How the player advances when the current item finishes.
+ *
+ * - `Off` — stop after the last item; emit {@link PlaybackStatus.Ended}.
+ * - `One` — repeat the current item indefinitely.
+ * - `All` — wrap from the last item back to the first.
+ */
+export enum LoopMode {
+   Off = 'off',
+   One = 'one',
+   All = 'all',
+}
+
+/**
+ * Metadata for an audio source, used for OS transport control integration
  * (lock screen, notification shade, headphone controls, etc.).
  */
 export interface AudioMetadata {
@@ -70,28 +82,38 @@ export interface AudioMetadata {
 }
 
 /**
+ * A single item in a playlist.
+ */
+export interface PlaylistItem {
+
+   /** URL or file path of the audio source. */
+   src: string;
+
+   /** Optional metadata for OS transport controls. */
+   metadata?: AudioMetadata;
+}
+
+/**
  * The complete state of the audio player at a point in time.
  *
- * Inspired by Vidstack's player state model, this captures all relevant playback
- * properties: source info, timing, volume, and error state.
+ * `currentTime` and `duration` refer to the active playlist item, identified
+ * by `currentIndex` into `playlist`.
  */
 export interface PlayerState<S extends PlaybackStatus> {
    status: S;
-   src: string | null;
-   title: string | null;
-   artist: string | null;
-   artwork: string | null;
+   playlist: PlaylistItem[];
+   currentIndex: number | null;
    currentTime: number;
    duration: number;
    volume: number;
    muted: boolean;
    playbackRate: number;
-   loop: boolean;
+   loopMode: LoopMode;
    error: string | null;
 }
 
 /**
- * Response from a transport action (load, play, pause, stop, seek).
+ * Response from a transport action (load, play, pause, stop, seek, next, prev).
  *
  * Wraps the resulting player state with status-expectation metadata so callers
  * can detect unexpected state transitions.
@@ -109,14 +131,16 @@ export interface AudioActionResponse<A extends AudioAction = AudioAction> {
 export interface AllAudioActions {
 
    /**
-    * Load an audio source.
+    * Load a playlist of audio sources.
     *
-    * @param src - URL or file path of the audio source.
-    * @param metadata - Optional metadata for OS transport
-    *   controls (title, artist, artwork).
+    * @param playlist - One or more {@link PlaylistItem}s. Empty playlists are rejected.
+    * @param startIndex - Zero-based index into the playlist to start from. Defaults to 0.
     * @returns The action response with the updated player state.
     */
-   [AudioAction.Load]: (src: string, metadata?: AudioMetadata) => Promise<AudioActionResponse<AudioAction.Load>>;
+   [AudioAction.Load]: (
+      playlist: PlaylistItem[],
+      startIndex?: number,
+   ) => Promise<AudioActionResponse<AudioAction.Load>>;
 
    /** Start or resume playback. */
    [AudioAction.Play]: () => Promise<AudioActionResponse<AudioAction.Play>>;
@@ -124,16 +148,37 @@ export interface AllAudioActions {
    /** Pause playback. */
    [AudioAction.Pause]: () => Promise<AudioActionResponse<AudioAction.Pause>>;
 
-   /** Stop playback and unload the audio source, resetting to Idle. */
+   /** Stop playback and unload the playlist, resetting to {@link PlaybackStatus.Idle}. */
    [AudioAction.Stop]: () => Promise<AudioActionResponse<AudioAction.Stop>>;
 
    /**
-    * Seek to a position in the audio.
+    * Seek to a position in the active item.
     *
     * @param position - The time in seconds to seek to.
-    * @returns The action response with the updated player state.
     */
    [AudioAction.Seek]: (position: number) => Promise<AudioActionResponse<AudioAction.Seek>>;
+
+   /**
+    * Advance to the next playlist item, with wrap-around when
+    * {@link LoopMode.All} is set. Transitions to {@link PlaybackStatus.Ended}
+    * at the end of a non-looping playlist.
+    */
+   [AudioAction.Next]: () => Promise<AudioActionResponse<AudioAction.Next>>;
+
+   /**
+    * Move to the previous item, or restart the current item if `currentTime`
+    * is greater than 3 seconds. Wraps to the last item when
+    * {@link LoopMode.All} is set.
+    */
+   [AudioAction.Prev]: () => Promise<AudioActionResponse<AudioAction.Prev>>;
+
+   /**
+    * Jump directly to a specific item in the playlist by index. Jumping to
+    * the currently active index restarts that item from the beginning.
+    *
+    * @param index - Zero-based index into the loaded playlist.
+    */
+   [AudioAction.JumpTo]: (index: number) => Promise<AudioActionResponse<AudioAction.JumpTo>>;
 }
 
 /**
@@ -160,40 +205,12 @@ export interface PlayerControls {
     * Receives updates for state transitions (status changes, volume,
     * settings, errors). For high-frequency time progression, use
     * {@link onTimeUpdate} instead.
-    *
-    * @param listener - Callback invoked when the player state
-    *   changes.
-    * @returns A promise with a function to remove the listener.
-    *
-    * @example
-    * ```ts
-    * const unlisten = await player.listen((updated) => {
-    *   console.log('Status:', updated.status);
-    * });
-    *
-    * // To stop listening:
-    * unlisten();
-    * ```
     */
    listen: (listener: (player: PlayerWithAnyStatus) => void) => Promise<UnlistenFn>;
 
    /**
     * Listen for high-frequency time progression updates during
     * playback (typically every 250ms).
-    *
-    * This is a lightweight event carrying only `currentTime` and
-    * `duration`, avoiding the overhead of serializing the full
-    * player state on every tick.
-    *
-    * @param listener - Callback invoked on each time update.
-    * @returns A promise with a function to remove the listener.
-    *
-    * @example
-    * ```ts
-    * const unlisten = await player.onTimeUpdate((time) => {
-    *   progressBar.value = time.currentTime / time.duration;
-    * });
-    * ```
     */
    onTimeUpdate: (listener: (time: TimeUpdate) => void) => Promise<UnlistenFn>;
 
@@ -201,7 +218,6 @@ export interface PlayerControls {
     * Set the volume level.
     *
     * @param level - Volume level between 0.0 (silent) and 1.0 (maximum).
-    * @returns The updated player state with actions attached.
     */
    setVolume: (level: number) => Promise<PlayerWithAnyStatus>;
 
@@ -209,7 +225,6 @@ export interface PlayerControls {
     * Mute or unmute the audio.
     *
     * @param muted - `true` to mute, `false` to unmute.
-    * @returns The updated player state with actions attached.
     */
    setMuted: (muted: boolean) => Promise<PlayerWithAnyStatus>;
 
@@ -217,17 +232,16 @@ export interface PlayerControls {
     * Set the playback speed.
     *
     * @param rate - Playback rate where 1.0 is normal speed.
-    * @returns The updated player state with actions attached.
     */
    setPlaybackRate: (rate: number) => Promise<PlayerWithAnyStatus>;
 
    /**
-    * Enable or disable looping.
+    * Set the loop behaviour for end-of-track auto-advance.
     *
-    * @param loop - `true` to loop, `false` for single playback.
-    * @returns The updated player state with actions attached.
+    * @param mode - One of {@link LoopMode.Off}, {@link LoopMode.One},
+    *   or {@link LoopMode.All}.
     */
-   setLoop: (loop: boolean) => Promise<PlayerWithAnyStatus>;
+   setLoopMode: (mode: LoopMode) => Promise<PlayerWithAnyStatus>;
 }
 
 // Only these transport actions are allowed for each given PlaybackStatus:
@@ -242,25 +256,45 @@ export const allowedActions = {
       AudioAction.Play,
       AudioAction.Seek,
       AudioAction.Stop,
+      AudioAction.Next,
+      AudioAction.Prev,
+      AudioAction.JumpTo,
    ],
    [PlaybackStatus.Playing]: [
       AudioAction.Pause,
       AudioAction.Seek,
       AudioAction.Stop,
+      AudioAction.Next,
+      AudioAction.Prev,
+      AudioAction.JumpTo,
    ],
    [PlaybackStatus.Paused]: [
       AudioAction.Play,
       AudioAction.Seek,
       AudioAction.Stop,
+      AudioAction.Next,
+      AudioAction.Prev,
+      AudioAction.JumpTo,
    ],
    [PlaybackStatus.Ended]: [
       AudioAction.Play,
       AudioAction.Seek,
       AudioAction.Load,
       AudioAction.Stop,
+      AudioAction.Next,
+      AudioAction.Prev,
+      AudioAction.JumpTo,
    ],
+   // From Error, the user can either reload the entire playlist or skip
+   // past the broken item via next/prev/jumpTo (preserving the rest of the
+   // playlist and the source-bytes cache for items that already loaded).
+   // Stop is also allowed so consumers can tear down cleanly.
    [PlaybackStatus.Error]: [
       AudioAction.Load,
+      AudioAction.Stop,
+      AudioAction.Next,
+      AudioAction.Prev,
+      AudioAction.JumpTo,
    ],
 } as const satisfies Record<PlaybackStatus, AudioAction[] | []>;
 
@@ -274,6 +308,28 @@ export const expectedStatusesForAction = {
       PlaybackStatus.Playing,
       PlaybackStatus.Paused,
       PlaybackStatus.Ended,
+   ],
+   // `next` ends in Ready (advanced from Ready/Paused), Playing (advanced from
+   // Playing — auto-resume on the new item), or Ended (fell off the end of a
+   // non-looping playlist). Pause is not preserved through advancement.
+   [AudioAction.Next]: [
+      PlaybackStatus.Ready,
+      PlaybackStatus.Playing,
+      PlaybackStatus.Ended,
+   ],
+   // `prev` either restarts the current item (preserves Ready/Playing/Paused)
+   // or advances to a previous item (Ready or Playing).
+   [AudioAction.Prev]: [
+      PlaybackStatus.Ready,
+      PlaybackStatus.Playing,
+      PlaybackStatus.Paused,
+   ],
+   // `jumpTo` either restarts the current item (preserves Ready/Playing/Paused)
+   // or jumps to a different item (Ready or Playing).
+   [AudioAction.JumpTo]: [
+      PlaybackStatus.Ready,
+      PlaybackStatus.Playing,
+      PlaybackStatus.Paused,
    ],
 } as const satisfies Record<AudioAction, PlaybackStatus[]>;
 
@@ -291,18 +347,6 @@ export type Player<S extends PlaybackStatus> = PlayerState<S> & AllowedActionsFo
  *
  * To narrow to a specific status, use either {@link hasAction} or the `status`
  * field as a discriminator.
- *
- * @example
- * ```ts
- * if (hasAction(player, AudioAction.Play)) {
- *    await player.play();
- * }
- *
- * // Or:
- * if (player.status === PlaybackStatus.Paused) {
- *    await player.play(); // TypeScript knows play() is available
- * }
- * ```
  */
 export type PlayerWithAnyStatus = { [T in PlaybackStatus]: Player<T> }[PlaybackStatus];
 
@@ -331,10 +375,6 @@ export function hasAction<A extends AudioAction>(
 
 /**
  * Checks whether the player has any transport actions available.
- *
- * Currently all statuses have at least one transport action, so this
- * always returns `true`. It is provided for forward-compatibility if
- * terminal statuses (with no actions) are added in the future.
  */
 export function hasAnyAction(player: PlayerWithAnyStatus): boolean {
    return allowedActions[player.status].length > 0;

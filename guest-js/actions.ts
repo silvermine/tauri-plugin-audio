@@ -1,8 +1,8 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { addPluginListener, invoke } from '@tauri-apps/api/core';
 import {
-   AllAudioActions, AudioAction, AudioActionResponse, AudioMetadata,
-   Player, PlayerControls, PlayerState, PlaybackStatus,
+   AllAudioActions, AudioAction, AudioActionResponse, LoopMode,
+   Player, PlayerControls, PlayerState, PlaybackStatus, PlaylistItem,
    PlayerWithAnyStatus, TimeUpdate, allowedActions,
 } from './types';
 
@@ -115,11 +115,19 @@ const timeUpdateEventManager = new PluginEventManager<TimeUpdate, TimeUpdate>(
    (event) => { return event; }
 );
 
+/**
+ * Maps a TypeScript-side action name (camelCase) to its Tauri command name
+ * (snake_case). Single-word actions like `load` pass through unchanged.
+ */
+function ipcCommand(action: AudioAction): string {
+   return action.replace(/[A-Z]/g, (c) => { return `_${c.toLowerCase()}`; });
+}
+
 async function sendAction<A extends AudioAction>(
    action: A,
    args: Record<string, unknown>
 ): Promise<AudioActionResponse<A>> {
-   const response = await invoke<AudioActionResponse<A>>(`plugin:audio|${action}`, args);
+   const response = await invoke<AudioActionResponse<A>>(`plugin:audio|${ipcCommand(action)}`, args);
 
    response.player = attachPlayer(response.player);
    return response;
@@ -135,8 +143,8 @@ async function sendSetting(
 }
 
 const transportActions = {
-   async load(src: string, metadata?: AudioMetadata) {
-      return sendAction(AudioAction.Load, { src, metadata });
+   async load(playlist: PlaylistItem[], startIndex?: number) {
+      return sendAction(AudioAction.Load, { playlist, startIndex });
    },
 
    async play() {
@@ -153,6 +161,18 @@ const transportActions = {
 
    async seek(position: number) {
       return sendAction(AudioAction.Seek, { position });
+   },
+
+   async next() {
+      return sendAction(AudioAction.Next, {});
+   },
+
+   async prev() {
+      return sendAction(AudioAction.Prev, {});
+   },
+
+   async jumpTo(index: number) {
+      return sendAction(AudioAction.JumpTo, { index });
    },
 } satisfies AllAudioActions;
 
@@ -177,21 +197,18 @@ const playerControls = {
       return sendSetting('set_playback_rate', { rate });
    },
 
-   async setLoop(loop: boolean) {
-      return sendSetting('set_loop', { looping: loop });
+   async setLoopMode(mode: LoopMode) {
+      return sendSetting('set_loop_mode', { mode });
    },
 } satisfies PlayerControls;
 
 /**
  * Attaches transport actions (gated by status) and player controls (always available)
  * to a raw {@link PlayerState}, producing a {@link Player} object.
- *
- * @param state - The deserialized player state from the plugin.
  */
 export function attachPlayer<S extends PlaybackStatus>(state: PlayerState<S>): Player<S> {
    const player = { ...state } satisfies PlayerState<S>;
 
-   // Attach state-gated transport actions.
    const actionsForStatus = allowedActions[state.status];
 
    for (const actionName of actionsForStatus) {
@@ -200,15 +217,11 @@ export function attachPlayer<S extends PlaybackStatus>(state: PlayerState<S>): P
       });
    }
 
-   // Attach always-available controls.
    for (const [ name, fn ] of Object.entries(playerControls)) {
       Object.defineProperty(player, name, {
          value: fn,
       });
    }
 
-   // SAFETY: Transport actions and controls were attached above via
-   // Object.defineProperty, matching the shape of Player<S>. TypeScript
-   // cannot verify dynamically-added properties.
    return player as unknown as Player<S>;
 }

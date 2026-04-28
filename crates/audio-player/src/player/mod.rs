@@ -4,7 +4,7 @@ mod source;
 mod stretch;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use rodio::Player;
@@ -15,7 +15,10 @@ use self::resume_fade::ResumeFadeHandle;
 use self::source::{SeekStrategy, SourceDescriptor, load_source_descriptor, open_source_at};
 
 use crate::error::{Error, Result};
-use crate::models::{AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerState, TimeUpdate};
+use crate::models::{
+   AudioActionResponse, LoopMode, PlaybackStatus, PlayerState, PlaylistItem, TimeUpdate,
+};
+use crate::transitions::NavTarget;
 use crate::{OnChanged, OnTimeUpdate, transitions};
 
 /// Audio player backed by Rodio for cross-platform desktop playback.
@@ -28,6 +31,9 @@ pub struct RodioAudioPlayer {
    output_sink: MixerDeviceSink,
    on_changed: OnChanged,
    on_time_update: OnTimeUpdate,
+   /// Weak self-reference so the monitor thread can call back without
+   /// keeping the player alive after its owner has dropped it.
+   weak_self: Weak<Self>,
 }
 
 struct Inner {
@@ -53,11 +59,14 @@ impl RodioAudioPlayer {
    ///
    /// Opens the default audio output device. Returns an error
    /// if no audio device is available.
-   pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Self> {
+   ///
+   /// Returns an `Arc` so the monitor thread can hold a weak self-reference
+   /// for auto-advance callbacks.
+   pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Arc<Self>> {
       let mut output_sink = open_audio_output()?;
       output_sink.log_on_drop(false);
 
-      Ok(Self {
+      Ok(Arc::new_cyclic(|weak_self| Self {
          inner: Arc::new(Mutex::new(Inner {
             state: PlayerState::default(),
             playback: None,
@@ -68,7 +77,8 @@ impl RodioAudioPlayer {
          output_sink,
          on_changed,
          on_time_update,
-      })
+         weak_self: weak_self.clone(),
+      }))
    }
 
    /// Stops the monitor thread by setting the flag.
@@ -82,19 +92,20 @@ impl RodioAudioPlayer {
    /// observes the stop flag on its next poll. This is harmless — any
    /// duplicate time updates are benign, and the state is already updated
    /// under the mutex before the new monitor starts, so the old one cannot
-   /// trigger a spurious Ended transition.
+   /// trigger a spurious auto-advance.
    fn start_monitor(&self, inner: &mut Inner) {
       let stop = Arc::new(AtomicBool::new(false));
       inner.monitor_stop = stop.clone();
 
-      let inner_arc = Arc::clone(&self.inner);
-      let on_changed = Arc::clone(&self.on_changed);
-      let on_time_update = Arc::clone(&self.on_time_update);
+      let Some(player) = self.weak_self.upgrade() else {
+         warn!("Cannot start monitor: player has been dropped");
+         return;
+      };
 
       if let Err(e) = std::thread::Builder::new()
          .name("audio-monitor".into())
          .spawn(move || {
-            monitor_loop(stop, inner_arc, on_changed, on_time_update);
+            monitor_loop(stop, player);
          })
       {
          warn!("Failed to spawn audio monitor thread: {e}");
@@ -105,22 +116,32 @@ impl RodioAudioPlayer {
       lock_inner(&self.inner).state.clone()
    }
 
-   pub fn load(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
-      let meta = metadata.unwrap_or_default();
+   /// Loads a playlist and prepares the chosen (or first) item for playback.
+   pub fn load(
+      &self,
+      playlist: Vec<PlaylistItem>,
+      start_index: Option<usize>,
+   ) -> Result<AudioActionResponse> {
+      let start_index = start_index.unwrap_or(0);
 
-      let load_generation = {
+      let (item_src, load_generation) = {
          let mut inner = lock_inner(&self.inner);
-         transitions::begin_load(&mut inner.state, src, &meta)?;
+         transitions::begin_load(&mut inner.state, playlist, start_index)?;
          inner.load_generation = inner.load_generation.wrapping_add(1);
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let load_generation = inner.load_generation;
+         let src = inner
+            .state
+            .current()
+            .map(|item| item.src.clone())
+            .ok_or_else(|| Error::InvalidState("Missing current item after begin_load".into()))?;
          let snapshot = inner.state.clone();
          drop(inner);
          (self.on_changed)(&snapshot);
-         load_generation
+         (src, load_generation)
       };
 
-      let result = self.load_inner(src, &meta, load_generation);
+      let result = self.load_inner(&item_src, load_generation);
 
       match result {
          Ok(snapshot) => {
@@ -142,12 +163,10 @@ impl RodioAudioPlayer {
       }
    }
 
-   fn load_inner(
-      &self,
-      src: &str,
-      meta: &AudioMetadata,
-      load_generation: u64,
-   ) -> Result<PlayerState> {
+   /// Inner load logic that performs I/O for an already-set current item and
+   /// finalizes the state to `Ready`. Used by `load`, `next`, `prev`, and
+   /// auto-advance.
+   fn load_inner(&self, src: &str, load_generation: u64) -> Result<PlayerState> {
       let descriptor = load_source_descriptor(src)?;
 
       let mut attempted_playback_rate = lock_inner(&self.inner).state.playback_rate;
@@ -195,11 +214,15 @@ impl RodioAudioPlayer {
             }
          }
 
-         transitions::load(&mut inner.state, src, meta, duration)?;
+         transitions::load(&mut inner.state, duration)?;
 
          Self::stop_monitor(&inner);
 
          sink.set_volume(effective_volume(&inner.state));
+
+         if let Some(prev) = inner.playback.take() {
+            prev.sink.stop();
+         }
 
          inner.playback = Some(PlaybackContext {
             sink,
@@ -658,16 +681,150 @@ impl RodioAudioPlayer {
       Ok(snapshot)
    }
 
-   pub fn set_loop(&self, looping: bool) -> PlayerState {
+   pub fn set_loop_mode(&self, mode: LoopMode) -> PlayerState {
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
-         transitions::set_loop(&mut inner.state, looping);
+         transitions::set_loop_mode(&mut inner.state, mode);
          inner.state.clone()
       };
 
       (self.on_changed)(&snapshot);
       snapshot
    }
+
+   /// Advance to the next playlist item, with wrap-around if `loopMode` is `All`.
+   /// Errors with `InvalidState` from `Idle` / `Loading`.
+   pub fn next(&self) -> Result<AudioActionResponse> {
+      self.navigate(Direction::Next)
+   }
+
+   /// Move to the previous item, or restart the current item if `currentTime > 3s`
+   /// or we're at the start of a non-looping playlist.
+   pub fn prev(&self) -> Result<AudioActionResponse> {
+      self.navigate(Direction::Prev)
+   }
+
+   /// Jump to a specific item in the loaded playlist by index.
+   ///
+   /// Errors with `InvalidState` from `Idle` / `Loading` and with
+   /// `InvalidValue` if the index is out of range. Jumping to the currently
+   /// active index restarts that item from the beginning.
+   pub fn jump_to(&self, index: usize) -> Result<AudioActionResponse> {
+      let target = {
+         let inner = lock_inner(&self.inner);
+         transitions::jump_target(&inner.state, index)?
+      };
+
+      match target {
+         NavTarget::Index(idx) => self.advance_to(idx),
+         NavTarget::RestartCurrent => self.seek(0.0),
+         NavTarget::End => self.transition_to_ended(),
+      }
+   }
+
+   fn navigate(&self, direction: Direction) -> Result<AudioActionResponse> {
+      let target = {
+         let inner = lock_inner(&self.inner);
+         match direction {
+            Direction::Next => transitions::next_target(&inner.state)?,
+            Direction::Prev => transitions::prev_target(&inner.state)?,
+         }
+      };
+
+      match target {
+         NavTarget::Index(index) => self.advance_to(index),
+         NavTarget::RestartCurrent => self.seek(0.0),
+         NavTarget::End => self.transition_to_ended(),
+      }
+   }
+
+   /// Loads `playlist[index]` while preserving play intent — if the player was
+   /// `Playing` before the call, it resumes playing the new item once loaded.
+   ///
+   /// Always emits a `Loading` state-changed event before fetching, even when
+   /// the source bytes are already cached. The cache makes the Loading window
+   /// effectively instantaneous, but the event is preserved so consumers see
+   /// identical state-machine emissions on desktop and on native mobile
+   /// platforms (iOS AVPlayer / Android ExoPlayer always emit Loading).
+   fn advance_to(&self, index: usize) -> Result<AudioActionResponse> {
+      let (was_playing, item_src, load_generation) = {
+         let mut inner = lock_inner(&self.inner);
+         let was_playing = inner.state.status == PlaybackStatus::Playing;
+
+         transitions::begin_load_index(&mut inner.state, index)?;
+         inner.load_generation = inner.load_generation.wrapping_add(1);
+         inner.seek_generation = inner.seek_generation.wrapping_add(1);
+         let load_generation = inner.load_generation;
+
+         let src = inner
+            .state
+            .current()
+            .map(|item| item.src.clone())
+            .ok_or_else(|| Error::InvalidState("Missing current item after begin_load".into()))?;
+
+         Self::stop_monitor(&inner);
+         if let Some(ctx) = inner.playback.take() {
+            ctx.sink.stop();
+         }
+
+         let snapshot = inner.state.clone();
+         drop(inner);
+         (self.on_changed)(&snapshot);
+         (was_playing, src, load_generation)
+      };
+
+      let ready_snapshot = match self.load_inner(&item_src, load_generation) {
+         Ok(snapshot) => {
+            (self.on_changed)(&snapshot);
+            snapshot
+         }
+         Err(error) => {
+            let snapshot = {
+               let mut inner = lock_inner(&self.inner);
+               finish_load_as_error(&mut inner, load_generation, error.to_string())
+            };
+            if let Some(snapshot) = snapshot {
+               (self.on_changed)(&snapshot);
+            }
+            return Err(error);
+         }
+      };
+
+      if was_playing {
+         self.play()
+      } else {
+         Ok(AudioActionResponse::new(
+            ready_snapshot,
+            PlaybackStatus::Ready,
+         ))
+      }
+   }
+
+   /// Transitions to `Ended` when navigation falls off the end of a non-looping
+   /// playlist.
+   fn transition_to_ended(&self) -> Result<AudioActionResponse> {
+      let snapshot = {
+         let mut inner = lock_inner(&self.inner);
+
+         transitions::ended(&mut inner.state);
+
+         Self::stop_monitor(&inner);
+         if let Some(ctx) = &inner.playback {
+            ctx.sink.pause();
+         }
+
+         inner.state.clone()
+      };
+
+      (self.on_changed)(&snapshot);
+      Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ended))
+   }
+}
+
+#[derive(Copy, Clone)]
+enum Direction {
+   Next,
+   Prev,
 }
 
 // ---------------------------------------------------------------------------
@@ -706,12 +863,12 @@ fn finish_load_as_error(
 // ---------------------------------------------------------------------------
 
 /// Polls the sink every 250ms for position updates and end-of-track detection.
-fn monitor_loop(
-   stop: Arc<AtomicBool>,
-   inner: Arc<Mutex<Inner>>,
-   on_changed: OnChanged,
-   on_time_update: OnTimeUpdate,
-) {
+///
+/// On end-of-track, consults [`transitions::auto_advance_target`] to decide
+/// whether to restart the current item ([`LoopMode::One`]), advance to the
+/// next playlist item (with [`LoopMode::All`] wrap-around), or transition to
+/// `Ended`.
+fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
    loop {
       std::thread::sleep(Duration::from_millis(250));
 
@@ -719,7 +876,7 @@ fn monitor_loop(
          break;
       }
 
-      let mut guard = lock_inner(&inner);
+      let mut guard = lock_inner(&player.inner);
 
       let (pos, duration, is_empty) = match &guard.playback {
          Some(ctx) => {
@@ -732,81 +889,96 @@ fn monitor_loop(
       };
 
       if is_empty {
-         if guard.state.looping {
-            // Re-append source for seamless (best-effort) loop.
-            let playback_rate = guard.state.playback_rate;
-            let load_generation = guard.load_generation;
-            let seek_generation = guard.seek_generation;
-            let Some(source_descriptor) = guard.playback.as_ref().map(|ctx| ctx.source.clone())
-            else {
-               break;
-            };
-            drop(guard);
-
-            let reopened_source = open_source_at(&source_descriptor, 0.0, playback_rate);
-
-            let mut guard = lock_inner(&inner);
-
-            match classify_loop_reopen_attempt(&guard, &stop, load_generation, seek_generation) {
-               LoopReopenAttempt::Apply => {}
-               LoopReopenAttempt::Retry => continue,
-               LoopReopenAttempt::Break => break,
-            }
-
-            // Discard stale reopen work if this monitor was stopped or playback
-            // changed state while open_source_at() was running.
-            if stop.load(Ordering::Relaxed) || guard.state.status != PlaybackStatus::Playing {
-               break;
-            }
-
-            if !guard.state.looping {
-               let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
+         match transitions::auto_advance_target(&guard.state) {
+            NavTarget::RestartCurrent => {
+               // Re-append source for seamless (best-effort) loop.
+               let playback_rate = guard.state.playback_rate;
+               let load_generation = guard.load_generation;
+               let seek_generation = guard.seek_generation;
+               let Some(source_descriptor) = guard.playback.as_ref().map(|ctx| ctx.source.clone())
+               else {
+                  break;
+               };
                drop(guard);
-               on_changed(&snapshot);
-               break;
-            }
 
-            match reopened_source {
-               Ok(source) => {
-                  let position_latency = source.position_latency;
-                  let seek_strategy = source.seek_strategy;
-                  let resume_fade = source.resume_fade;
+               let reopened_source = open_source_at(&source_descriptor, 0.0, playback_rate);
 
-                  if let Some(ctx) = &mut guard.playback {
-                     ctx.sink.append(source.source);
-                     ctx.position_offset = 0.0;
-                     ctx.position_latency = position_latency;
-                     ctx.seek_strategy = seek_strategy;
-                     ctx.resume_fade = resume_fade;
-                  } else {
-                     break;
-                  }
+               let mut guard = lock_inner(&player.inner);
 
-                  guard.state.current_time = 0.0;
-                  drop(guard);
-                  on_time_update(&TimeUpdate {
-                     current_time: 0.0,
-                     duration,
-                  });
+               match classify_loop_reopen_attempt(&guard, &stop, load_generation, seek_generation) {
+                  LoopReopenAttempt::Apply => {}
+                  LoopReopenAttempt::Retry => continue,
+                  LoopReopenAttempt::Break => break,
                }
-               Err(e) => {
-                  warn!("Failed to reopen loop source: {e}");
-                  let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
-                  drop(guard);
-                  on_changed(&snapshot);
+
+               // Discard stale reopen work if this monitor was stopped or playback
+               // changed state while open_source_at() was running.
+               if stop.load(Ordering::Relaxed) || guard.state.status != PlaybackStatus::Playing {
                   break;
                }
+
+               // Loop mode may have changed during the reopen window.
+               if !matches!(
+                  transitions::auto_advance_target(&guard.state),
+                  NavTarget::RestartCurrent
+               ) {
+                  let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
+                  drop(guard);
+                  (player.on_changed)(&snapshot);
+                  break;
+               }
+
+               match reopened_source {
+                  Ok(source) => {
+                     let position_latency = source.position_latency;
+                     let seek_strategy = source.seek_strategy;
+                     let resume_fade = source.resume_fade;
+
+                     if let Some(ctx) = &mut guard.playback {
+                        ctx.sink.append(source.source);
+                        ctx.position_offset = 0.0;
+                        ctx.position_latency = position_latency;
+                        ctx.seek_strategy = seek_strategy;
+                        ctx.resume_fade = resume_fade;
+                     } else {
+                        break;
+                     }
+
+                     guard.state.current_time = 0.0;
+                     drop(guard);
+                     (player.on_time_update)(&TimeUpdate {
+                        current_time: 0.0,
+                        duration,
+                     });
+                  }
+                  Err(e) => {
+                     warn!("Failed to reopen loop source: {e}");
+                     let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
+                     drop(guard);
+                     (player.on_changed)(&snapshot);
+                     break;
+                  }
+               }
             }
-         } else {
-            let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
-            drop(guard);
-            on_changed(&snapshot);
-            break;
+            NavTarget::Index(idx) => {
+               drop(guard);
+               if let Err(e) = player.advance_to(idx) {
+                  warn!("Auto-advance failed: {e}");
+               }
+               // `advance_to` (via `play`) starts a fresh monitor; this one exits.
+               break;
+            }
+            NavTarget::End => {
+               let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
+               drop(guard);
+               (player.on_changed)(&snapshot);
+               break;
+            }
          }
       } else {
          guard.state.current_time = pos;
          drop(guard);
-         on_time_update(&TimeUpdate {
+         (player.on_time_update)(&TimeUpdate {
             current_time: pos,
             duration,
          });
@@ -1024,7 +1196,11 @@ mod tests {
    fn finish_load_as_error_updates_matching_loading_request() {
       let mut inner = inner_with_state(PlayerState {
          status: PlaybackStatus::Loading,
-         src: Some("fixture.mp3".to_string()),
+         playlist: vec![PlaylistItem {
+            src: "fixture.mp3".to_string(),
+            metadata: None,
+         }],
+         current_index: Some(0),
          ..Default::default()
       });
       inner.load_generation = 7;

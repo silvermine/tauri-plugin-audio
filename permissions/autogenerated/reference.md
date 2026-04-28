@@ -9,10 +9,13 @@ Default permissions for the plugin
 - `allow-pause`
 - `allow-stop`
 - `allow-seek`
+- `allow-next`
+- `allow-prev`
+- `allow-jump-to`
 - `allow-set-volume`
 - `allow-set-muted`
 - `allow-set-playback-rate`
-- `allow-set-loop`
+- `allow-set-loop-mode`
 - `allow-get-state`
 - `allow-is-native`
 
@@ -80,6 +83,32 @@ Denies the is_native command without any pre-configured scope.
 <tr>
 <td>
 
+`audio:allow-jump-to`
+
+</td>
+<td>
+
+Enables the jump_to command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`audio:deny-jump-to`
+
+</td>
+<td>
+
+Denies the jump_to command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `audio:allow-load`
 
 </td>
@@ -99,6 +128,32 @@ Enables the load command without any pre-configured scope.
 <td>
 
 Denies the load command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`audio:allow-next`
+
+</td>
+<td>
+
+Enables the next command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`audio:deny-next`
+
+</td>
+<td>
+
+Denies the next command without any pre-configured scope.
 
 </td>
 </tr>
@@ -158,6 +213,32 @@ Denies the play command without any pre-configured scope.
 <tr>
 <td>
 
+`audio:allow-prev`
+
+</td>
+<td>
+
+Enables the prev command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`audio:deny-prev`
+
+</td>
+<td>
+
+Denies the prev command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `audio:allow-seek`
 
 </td>
@@ -184,12 +265,12 @@ Denies the seek command without any pre-configured scope.
 <tr>
 <td>
 
-`audio:allow-set-loop`
+`audio:allow-set-loop-mode`
 
 </td>
 <td>
 
-Enables the set_loop command without any pre-configured scope.
+Enables the set_loop_mode command without any pre-configured scope.
 
 </td>
 </tr>
@@ -197,12 +278,12 @@ Enables the set_loop command without any pre-configured scope.
 <tr>
 <td>
 
-`audio:deny-set-loop`
+`audio:deny-set-loop-mode`
 
 </td>
 <td>
 
-Denies the set_loop command without any pre-configured scope.
+Denies the set_loop_mode command without any pre-configured scope.
 
 </td>
 </tr>

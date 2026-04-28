@@ -1,17 +1,17 @@
 use tauri::{AppHandle, Runtime, command};
 
 use audio_player::Result;
-use audio_player::models::{AudioActionResponse, AudioMetadata, PlayerState};
+use audio_player::models::{AudioActionResponse, LoopMode, PlayerState, PlaylistItem};
 
 use crate::AudioExt;
 
 #[command]
 pub(crate) async fn load<R: Runtime>(
    app: AppHandle<R>,
-   src: String,
-   metadata: Option<AudioMetadata>,
+   playlist: Vec<PlaylistItem>,
+   start_index: Option<usize>,
 ) -> Result<AudioActionResponse> {
-   app.audio().load(&src, metadata)
+   app.audio().load(playlist, start_index)
 }
 
 #[command]
@@ -38,6 +38,24 @@ pub(crate) async fn seek<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn next<R: Runtime>(app: AppHandle<R>) -> Result<AudioActionResponse> {
+   app.audio().next()
+}
+
+#[command]
+pub(crate) async fn prev<R: Runtime>(app: AppHandle<R>) -> Result<AudioActionResponse> {
+   app.audio().prev()
+}
+
+#[command]
+pub(crate) async fn jump_to<R: Runtime>(
+   app: AppHandle<R>,
+   index: usize,
+) -> Result<AudioActionResponse> {
+   app.audio().jump_to(index)
+}
+
+#[command]
 pub(crate) async fn set_volume<R: Runtime>(app: AppHandle<R>, level: f64) -> Result<PlayerState> {
    app.audio().set_volume(level)
 }
@@ -56,8 +74,11 @@ pub(crate) async fn set_playback_rate<R: Runtime>(
 }
 
 #[command]
-pub(crate) async fn set_loop<R: Runtime>(app: AppHandle<R>, looping: bool) -> Result<PlayerState> {
-   Ok(app.audio().set_loop(looping))
+pub(crate) async fn set_loop_mode<R: Runtime>(
+   app: AppHandle<R>,
+   mode: LoopMode,
+) -> Result<PlayerState> {
+   Ok(app.audio().set_loop_mode(mode))
 }
 
 #[command]
@@ -67,7 +88,5 @@ pub(crate) async fn get_state<R: Runtime>(app: AppHandle<R>) -> Result<PlayerSta
 
 #[command]
 pub(crate) async fn is_native<R: Runtime>(_app: AppHandle<R>) -> Result<bool> {
-   // Desktop is not "native" in the mobile plugin sense. When mobile implementations
-   // are added, this will return `true` on iOS/Android to switch the event transport.
    Ok(false)
 }

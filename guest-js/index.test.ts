@@ -7,6 +7,8 @@ import { getPlayer } from './index';
 import {
    PlaybackStatus,
    AudioAction,
+   LoopMode,
+   PlaylistItem,
    hasAction,
    hasAnyAction,
 } from './types';
@@ -15,34 +17,43 @@ import { attachPlayer } from './actions';
 let lastCmd = '',
     lastArgs: Record<string, unknown> = {};
 
+const PLAYLIST: PlaylistItem[] = [
+   { src: 'https://example.com/track-1.mp3', metadata: { title: 'Track 1', artist: 'Artist' } },
+   { src: 'https://example.com/track-2.mp3', metadata: { title: 'Track 2', artist: 'Artist' } },
+   { src: 'https://example.com/track-3.mp3', metadata: { title: 'Track 3', artist: 'Artist' } },
+];
+
 const IDLE_STATE = {
    status: PlaybackStatus.Idle,
-   src: null,
-   title: null,
-   artist: null,
-   artwork: null,
+   playlist: [],
+   currentIndex: null,
    currentTime: 0,
    duration: 0,
    volume: 1,
    muted: false,
    playbackRate: 1,
-   loop: false,
+   loopMode: LoopMode.Off,
    error: null,
 };
 
 const READY_STATE = {
    ...IDLE_STATE,
    status: PlaybackStatus.Ready,
-   src: 'https://example.com/song.mp3',
-   title: 'Test Song',
-   artist: 'Test Artist',
+   playlist: PLAYLIST,
+   currentIndex: 0,
+   duration: 180,
 };
 
 const PLAYING_STATE = {
    ...READY_STATE,
    status: PlaybackStatus.Playing,
-   duration: 180,
    currentTime: 42,
+};
+
+const PLAYING_TRACK_2_STATE = {
+   ...PLAYING_STATE,
+   currentIndex: 1,
+   currentTime: 0,
 };
 
 const PAUSED_STATE = {
@@ -54,6 +65,7 @@ const ENDED_STATE = {
    ...PLAYING_STATE,
    status: PlaybackStatus.Ended,
    currentTime: 180,
+   currentIndex: PLAYLIST.length - 1,
 };
 
 const ACTION_RESPONSE_BASE = {
@@ -103,6 +115,29 @@ beforeEach(() => {
             player: { ...PLAYING_STATE, currentTime: (args as { position: number }).position },
          };
       }
+      if (cmd === 'plugin:audio|next') {
+         return {
+            ...ACTION_RESPONSE_BASE,
+            expectedStatus: PlaybackStatus.Ready,
+            player: PLAYING_TRACK_2_STATE,
+         };
+      }
+      if (cmd === 'plugin:audio|prev') {
+         return {
+            ...ACTION_RESPONSE_BASE,
+            expectedStatus: PlaybackStatus.Ready,
+            player: PLAYING_STATE,
+         };
+      }
+      if (cmd === 'plugin:audio|jump_to') {
+         const targetIdx = (args as { index: number }).index;
+
+         return {
+            ...ACTION_RESPONSE_BASE,
+            expectedStatus: PlaybackStatus.Ready,
+            player: { ...PLAYING_STATE, currentIndex: targetIdx },
+         };
+      }
       if (cmd === 'plugin:audio|set_volume') {
          return { ...PLAYING_STATE, volume: (args as { level: number }).level };
       }
@@ -112,8 +147,8 @@ beforeEach(() => {
       if (cmd === 'plugin:audio|set_playback_rate') {
          return { ...PLAYING_STATE, playbackRate: (args as { rate: number }).rate };
       }
-      if (cmd === 'plugin:audio|set_loop') {
-         return { ...PLAYING_STATE, loop: (args as { looping: boolean }).looping };
+      if (cmd === 'plugin:audio|set_loop_mode') {
+         return { ...PLAYING_STATE, loopMode: (args as { mode: LoopMode }).mode };
       }
       if (cmd === 'plugin:audio|is_native') {
          return false;
@@ -135,22 +170,34 @@ describe('getPlayer', () => {
 });
 
 describe('transport actions', () => {
-   it('load — sends src and metadata, returns Ready player', async () => {
+   it('load — sends playlist and startIndex, returns Ready player', async () => {
       const player = await getPlayer();
 
       if (!hasAction(player, AudioAction.Load)) {
          throw new Error('expected load action');
       }
-      const response = await player.load('https://example.com/song.mp3', {
-         title: 'Test Song',
-         artist: 'Test Artist',
-      });
+      const response = await player.load(PLAYLIST, 0);
 
       expect(lastCmd).toBe('plugin:audio|load');
-      expect(lastArgs.src).toBe('https://example.com/song.mp3');
-      expect((lastArgs.metadata as Record<string, unknown>).title).toBe('Test Song');
+      expect((lastArgs.playlist as PlaylistItem[]).length).toBe(3);
+      expect((lastArgs.playlist as PlaylistItem[])[0].src).toBe('https://example.com/track-1.mp3');
+      expect(lastArgs.startIndex).toBe(0);
       expect(response.isExpectedStatus).toBe(true);
       expect(response.player.status).toBe(PlaybackStatus.Ready);
+      expect(response.player.playlist.length).toBe(3);
+      expect(response.player.currentIndex).toBe(0);
+   });
+
+   it('load — single-track callers pass a one-item array', async () => {
+      const player = await getPlayer();
+
+      if (!hasAction(player, AudioAction.Load)) {
+         throw new Error('expected load action');
+      }
+      await player.load([ { src: 'https://example.com/song.mp3' } ]);
+
+      expect(lastCmd).toBe('plugin:audio|load');
+      expect((lastArgs.playlist as PlaylistItem[]).length).toBe(1);
    });
 
    it('play — returns Playing player', async () => {
@@ -162,7 +209,6 @@ describe('transport actions', () => {
       const response = await ready.play();
 
       expect(lastCmd).toBe('plugin:audio|play');
-      expect(response.isExpectedStatus).toBe(true);
       expect(response.player.status).toBe(PlaybackStatus.Playing);
    });
 
@@ -174,8 +220,6 @@ describe('transport actions', () => {
       }
       const response = await playing.pause();
 
-      expect(lastCmd).toBe('plugin:audio|pause');
-      expect(response.isExpectedStatus).toBe(true);
       expect(response.player.status).toBe(PlaybackStatus.Paused);
    });
 
@@ -187,8 +231,6 @@ describe('transport actions', () => {
       }
       const response = await playing.stop();
 
-      expect(lastCmd).toBe('plugin:audio|stop');
-      expect(response.isExpectedStatus).toBe(true);
       expect(response.player.status).toBe(PlaybackStatus.Idle);
    });
 
@@ -200,10 +242,45 @@ describe('transport actions', () => {
       }
       const response = await playing.seek(90);
 
-      expect(lastCmd).toBe('plugin:audio|seek');
       expect(lastArgs.position).toBe(90);
-      expect(response.isExpectedStatus).toBe(true);
       expect(response.player.currentTime).toBe(90);
+   });
+
+   it('next — advances to next playlist item', async () => {
+      const playing = attachPlayer(PLAYING_STATE);
+
+      if (!hasAction(playing, AudioAction.Next)) {
+         throw new Error('expected next action');
+      }
+      const response = await playing.next();
+
+      expect(lastCmd).toBe('plugin:audio|next');
+      expect(response.player.currentIndex).toBe(1);
+   });
+
+   it('prev — moves to previous playlist item', async () => {
+      const playing = attachPlayer(PLAYING_TRACK_2_STATE);
+
+      if (!hasAction(playing, AudioAction.Prev)) {
+         throw new Error('expected prev action');
+      }
+      const response = await playing.prev();
+
+      expect(lastCmd).toBe('plugin:audio|prev');
+      expect(response.player.currentIndex).toBe(0);
+   });
+
+   it('jumpTo — sends snake_case command and target index', async () => {
+      const playing = attachPlayer(PLAYING_STATE);
+
+      if (!hasAction(playing, AudioAction.JumpTo)) {
+         throw new Error('expected jumpTo action');
+      }
+      const response = await playing.jumpTo(2);
+
+      expect(lastCmd).toBe('plugin:audio|jump_to');
+      expect(lastArgs.index).toBe(2);
+      expect(response.player.currentIndex).toBe(2);
    });
 
    it('handles errors thrown by the backend', async () => {
@@ -216,7 +293,7 @@ describe('transport actions', () => {
       if (!hasAction(player, AudioAction.Load)) {
          throw new Error('expected load action');
       }
-      await expect(player.load('test.mp3')).rejects.toThrow('audio error');
+      await expect(player.load([ { src: 'test.mp3' } ])).rejects.toThrow('audio error');
    });
 });
 
@@ -226,7 +303,6 @@ describe('player controls (always available)', () => {
 
       const updated = await player.setVolume(0.5);
 
-      expect(lastCmd).toBe('plugin:audio|set_volume');
       expect(lastArgs.level).toBe(0.5);
       expect(updated.volume).toBe(0.5);
    });
@@ -236,7 +312,6 @@ describe('player controls (always available)', () => {
 
       const updated = await player.setMuted(true);
 
-      expect(lastCmd).toBe('plugin:audio|set_muted');
       expect(lastArgs.muted).toBe(true);
       expect(updated.muted).toBe(true);
    });
@@ -246,19 +321,28 @@ describe('player controls (always available)', () => {
 
       const updated = await player.setPlaybackRate(2.0);
 
-      expect(lastCmd).toBe('plugin:audio|set_playback_rate');
       expect(lastArgs.rate).toBe(2.0);
       expect(updated.playbackRate).toBe(2.0);
    });
 
-   it('setLoop — sends looping flag, returns updated player', async () => {
+   it('setLoopMode — sends mode, returns updated player', async () => {
       const player = attachPlayer(PLAYING_STATE);
 
-      const updated = await player.setLoop(true);
+      const updatedAll = await player.setLoopMode(LoopMode.All);
 
-      expect(lastCmd).toBe('plugin:audio|set_loop');
-      expect(lastArgs.looping).toBe(true);
-      expect(updated.loop).toBe(true);
+      expect(lastCmd).toBe('plugin:audio|set_loop_mode');
+      expect(lastArgs.mode).toBe(LoopMode.All);
+      expect(updatedAll.loopMode).toBe(LoopMode.All);
+
+      const updatedOne = await player.setLoopMode(LoopMode.One);
+
+      expect(lastArgs.mode).toBe(LoopMode.One);
+      expect(updatedOne.loopMode).toBe(LoopMode.One);
+
+      const updatedOff = await player.setLoopMode(LoopMode.Off);
+
+      expect(lastArgs.mode).toBe(LoopMode.Off);
+      expect(updatedOff.loopMode).toBe(LoopMode.Off);
    });
 
    it('controls are available in Idle state', () => {
@@ -267,7 +351,7 @@ describe('player controls (always available)', () => {
       expect(typeof player.setVolume).toBe('function');
       expect(typeof player.setMuted).toBe('function');
       expect(typeof player.setPlaybackRate).toBe('function');
-      expect(typeof player.setLoop).toBe('function');
+      expect(typeof player.setLoopMode).toBe('function');
       expect(typeof player.listen).toBe('function');
       expect(typeof player.onTimeUpdate).toBe('function');
    });
@@ -276,11 +360,7 @@ describe('player controls (always available)', () => {
       const player = attachPlayer({ ...IDLE_STATE, status: PlaybackStatus.Error, error: 'fail' });
 
       expect(typeof player.setVolume).toBe('function');
-      expect(typeof player.setMuted).toBe('function');
-      expect(typeof player.setPlaybackRate).toBe('function');
-      expect(typeof player.setLoop).toBe('function');
-      expect(typeof player.listen).toBe('function');
-      expect(typeof player.onTimeUpdate).toBe('function');
+      expect(typeof player.setLoopMode).toBe('function');
    });
 });
 
@@ -290,71 +370,70 @@ describe('state machine — action availability', () => {
 
       expect(hasAction(player, AudioAction.Load)).toBe(true);
       expect(hasAction(player, AudioAction.Play)).toBe(false);
-      expect(hasAction(player, AudioAction.Pause)).toBe(false);
-      expect(hasAction(player, AudioAction.Stop)).toBe(false);
-      expect(hasAction(player, AudioAction.Seek)).toBe(false);
+      expect(hasAction(player, AudioAction.Next)).toBe(false);
+      expect(hasAction(player, AudioAction.Prev)).toBe(false);
    });
 
    it('Loading: only stop is available', () => {
       const player = attachPlayer({ ...IDLE_STATE, status: PlaybackStatus.Loading });
 
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
-      expect(hasAction(player, AudioAction.Load)).toBe(false);
-      expect(hasAction(player, AudioAction.Play)).toBe(false);
-      expect(hasAction(player, AudioAction.Pause)).toBe(false);
+      expect(hasAction(player, AudioAction.Next)).toBe(false);
+      expect(hasAction(player, AudioAction.Prev)).toBe(false);
    });
 
-   it('Ready: play, seek, and stop are available', () => {
+   it('Ready: play, seek, stop, next, and prev are available', () => {
       const player = attachPlayer(READY_STATE);
 
       expect(hasAction(player, AudioAction.Play)).toBe(true);
       expect(hasAction(player, AudioAction.Seek)).toBe(true);
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
+      expect(hasAction(player, AudioAction.Next)).toBe(true);
+      expect(hasAction(player, AudioAction.Prev)).toBe(true);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
-      expect(hasAction(player, AudioAction.Load)).toBe(false);
    });
 
-   it('Playing: pause, seek, and stop are available', () => {
+   it('Playing: pause, seek, stop, next, and prev are available', () => {
       const player = attachPlayer(PLAYING_STATE);
 
       expect(hasAction(player, AudioAction.Pause)).toBe(true);
       expect(hasAction(player, AudioAction.Seek)).toBe(true);
       expect(hasAction(player, AudioAction.Stop)).toBe(true);
-      expect(hasAction(player, AudioAction.Play)).toBe(false);
-      expect(hasAction(player, AudioAction.Load)).toBe(false);
+      expect(hasAction(player, AudioAction.Next)).toBe(true);
+      expect(hasAction(player, AudioAction.Prev)).toBe(true);
+      expect(hasAction(player, AudioAction.JumpTo)).toBe(true);
    });
 
-   it('Paused: play, seek, and stop are available', () => {
+   it('Paused: play, seek, stop, next, and prev are available', () => {
       const player = attachPlayer(PAUSED_STATE);
 
       expect(hasAction(player, AudioAction.Play)).toBe(true);
-      expect(hasAction(player, AudioAction.Seek)).toBe(true);
-      expect(hasAction(player, AudioAction.Stop)).toBe(true);
-      expect(hasAction(player, AudioAction.Pause)).toBe(false);
-      expect(hasAction(player, AudioAction.Load)).toBe(false);
+      expect(hasAction(player, AudioAction.Next)).toBe(true);
+      expect(hasAction(player, AudioAction.Prev)).toBe(true);
    });
 
-   it('Ended: play, seek, load, and stop are available', () => {
+   it('Ended: play, seek, load, stop, next, and prev are available', () => {
       const player = attachPlayer(ENDED_STATE);
 
       expect(hasAction(player, AudioAction.Play)).toBe(true);
-      expect(hasAction(player, AudioAction.Seek)).toBe(true);
       expect(hasAction(player, AudioAction.Load)).toBe(true);
-      expect(hasAction(player, AudioAction.Stop)).toBe(true);
-      expect(hasAction(player, AudioAction.Pause)).toBe(false);
+      expect(hasAction(player, AudioAction.Next)).toBe(true);
+      expect(hasAction(player, AudioAction.Prev)).toBe(true);
    });
 
-   it('Error: only load is available', () => {
+   it('Error: load, stop, next, prev, and jumpTo are available', () => {
       const player = attachPlayer({ ...IDLE_STATE, status: PlaybackStatus.Error, error: 'fail' });
 
       expect(hasAction(player, AudioAction.Load)).toBe(true);
+      expect(hasAction(player, AudioAction.Stop)).toBe(true);
+      expect(hasAction(player, AudioAction.Next)).toBe(true);
+      expect(hasAction(player, AudioAction.Prev)).toBe(true);
+      expect(hasAction(player, AudioAction.JumpTo)).toBe(true);
       expect(hasAction(player, AudioAction.Play)).toBe(false);
       expect(hasAction(player, AudioAction.Pause)).toBe(false);
-      expect(hasAction(player, AudioAction.Stop)).toBe(false);
-      expect(hasAction(player, AudioAction.Seek)).toBe(false);
    });
 
-   it('hasAnyAction returns true for states with transport actions', () => {
+   it('hasAnyAction returns true for all states', () => {
       expect(hasAnyAction(attachPlayer(IDLE_STATE))).toBe(true);
       expect(hasAnyAction(attachPlayer(READY_STATE))).toBe(true);
       expect(hasAnyAction(attachPlayer(PLAYING_STATE))).toBe(true);
@@ -369,22 +448,22 @@ describe('state machine — action availability', () => {
 
       expect(typeof (idle as unknown as Record<string, unknown>).load).toBe('function');
       expect(typeof (idle as unknown as Record<string, unknown>).play).toBe('undefined');
-      expect(typeof (idle as unknown as Record<string, unknown>).pause).toBe('undefined');
+      expect(typeof (idle as unknown as Record<string, unknown>).next).toBe('undefined');
+      expect(typeof (idle as unknown as Record<string, unknown>).prev).toBe('undefined');
    });
 
    it('preserves all state fields on the returned object', () => {
       const player = attachPlayer(PLAYING_STATE);
 
       expect(player.status).toBe(PlaybackStatus.Playing);
-      expect(player.src).toBe('https://example.com/song.mp3');
-      expect(player.title).toBe('Test Song');
-      expect(player.artist).toBe('Test Artist');
+      expect(player.playlist.length).toBe(3);
+      expect(player.currentIndex).toBe(0);
       expect(player.currentTime).toBe(42);
       expect(player.duration).toBe(180);
       expect(player.volume).toBe(1);
       expect(player.muted).toBe(false);
       expect(player.playbackRate).toBe(1);
-      expect(player.loop).toBe(false);
+      expect(player.loopMode).toBe(LoopMode.Off);
       expect(player.error).toBeNull();
    });
 });

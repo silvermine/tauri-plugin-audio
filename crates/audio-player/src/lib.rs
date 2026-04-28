@@ -5,7 +5,10 @@ mod player;
 pub mod transitions;
 
 pub use error::{Error, Result};
-pub use models::{AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerState, TimeUpdate};
+pub use models::{
+   AudioActionResponse, AudioMetadata, LoopMode, PlaybackStatus, PlayerState, PlaylistItem,
+   TimeUpdate,
+};
 pub use player::RodioAudioPlayer;
 
 use std::sync::Arc;
