@@ -1,18 +1,64 @@
 /**
  * Sanity checks to test the bridge between TypeScript and the Tauri commands.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockIPC, clearMocks } from '@tauri-apps/api/mocks';
+
+// Stub `@tauri-apps/api/event::listen` so tests can capture registered
+// handlers and fire synthetic events at them, exercising both the
+// per-channel routing and the `PluginEventManager` lifecycle.
+const eventState = vi.hoisted(() => {
+   return {
+      listeners: new Map<string, Set<(event: { payload: unknown }) => void>>(),
+      listenCalls: 0,
+   };
+});
+
+vi.mock('@tauri-apps/api/event', () => {
+   return {
+      listen: async (
+         eventName: string,
+         handler: (event: { payload: unknown }) => void
+      ): Promise<() => void> => {
+         eventState.listenCalls += 1;
+         const set = eventState.listeners.get(eventName) ?? new Set();
+
+         set.add(handler);
+         eventState.listeners.set(eventName, set);
+         return () => { set.delete(handler); };
+      },
+   };
+});
+
 import { getPlayer } from './index';
 import {
    PlaybackStatus,
    AudioAction,
    LoopMode,
    PlaylistItem,
+   SettingsChange,
+   StateChange,
+   TimeUpdate,
+   TrackChange,
    hasAction,
    hasAnyAction,
 } from './types';
 import { attachPlayer } from './actions';
+
+function fireEvent(eventName: string, payload: unknown): void {
+   eventState.listeners.get(eventName)?.forEach((h) => { h({ payload }); });
+}
+
+function resetEventMock(): void {
+   eventState.listeners.clear();
+   eventState.listenCalls = 0;
+}
+
+/** Placeholder listener used when a test only cares about subscription
+ * lifecycle counts and not the event payloads themselves. */
+function noop(): void {
+   // intentionally empty
+}
 
 let lastCmd = '',
     lastArgs: Record<string, unknown> = {};
@@ -157,7 +203,10 @@ beforeEach(() => {
    });
 });
 
-afterEach(() => { return clearMocks(); });
+afterEach(() => {
+   resetEventMock();
+   return clearMocks();
+});
 
 describe('getPlayer', () => {
    it('invokes get_state and returns a player with actions attached', async () => {
@@ -283,6 +332,81 @@ describe('transport actions', () => {
       expect(response.player.currentIndex).toBe(2);
    });
 
+   it('prev — from Ended (RestartCurrent path) preserves Ended status', async () => {
+      mockIPC((cmd) => {
+         lastCmd = cmd;
+         if (cmd === 'plugin:audio|prev') {
+            return {
+               ...ACTION_RESPONSE_BASE,
+               expectedStatus: PlaybackStatus.Ended,
+               player: { ...ENDED_STATE, currentTime: 0 },
+            };
+         }
+         return undefined;
+      });
+
+      const ended = attachPlayer(ENDED_STATE);
+
+      if (!hasAction(ended, AudioAction.Prev)) {
+         throw new Error('expected prev action');
+      }
+      const response = await ended.prev();
+
+      expect(response.player.status).toBe(PlaybackStatus.Ended);
+      expect(response.isExpectedStatus).toBe(true);
+   });
+
+   it('jumpTo — to current index from Ended preserves Ended status', async () => {
+      mockIPC((cmd, args) => {
+         lastCmd = cmd;
+         lastArgs = args as Record<string, unknown>;
+         if (cmd === 'plugin:audio|jump_to') {
+            return {
+               ...ACTION_RESPONSE_BASE,
+               expectedStatus: PlaybackStatus.Ended,
+               player: { ...ENDED_STATE, currentTime: 0 },
+            };
+         }
+         return undefined;
+      });
+
+      const ended = attachPlayer(ENDED_STATE);
+
+      if (!hasAction(ended, AudioAction.JumpTo)) {
+         throw new Error('expected jumpTo action');
+      }
+      const response = await ended.jumpTo(ENDED_STATE.currentIndex);
+
+      expect(response.player.status).toBe(PlaybackStatus.Ended);
+      expect(response.isExpectedStatus).toBe(true);
+   });
+
+   it('prev — from Paused preserves Paused status', async () => {
+      mockIPC((cmd, args) => {
+         lastCmd = cmd;
+         lastArgs = args as Record<string, unknown>;
+         if (cmd === 'plugin:audio|prev') {
+            return {
+               ...ACTION_RESPONSE_BASE,
+               expectedStatus: PlaybackStatus.Paused,
+               player: { ...PAUSED_STATE, currentIndex: 0, currentTime: 0 },
+            };
+         }
+         return undefined;
+      });
+
+      const paused = attachPlayer({ ...PAUSED_STATE, currentIndex: 1 });
+
+      if (!hasAction(paused, AudioAction.Prev)) {
+         throw new Error('expected prev action');
+      }
+      const response = await paused.prev();
+
+      expect(response.player.status).toBe(PlaybackStatus.Paused);
+      expect(response.player.currentIndex).toBe(0);
+      expect(response.isExpectedStatus).toBe(true);
+   });
+
    it('handles errors thrown by the backend', async () => {
       mockIPC(() => { throw new Error('audio error'); });
 
@@ -352,7 +476,9 @@ describe('player controls (always available)', () => {
       expect(typeof player.setMuted).toBe('function');
       expect(typeof player.setPlaybackRate).toBe('function');
       expect(typeof player.setLoopMode).toBe('function');
-      expect(typeof player.listen).toBe('function');
+      expect(typeof player.onStateChanged).toBe('function');
+      expect(typeof player.onTrackChanged).toBe('function');
+      expect(typeof player.onSettingsChanged).toBe('function');
       expect(typeof player.onTimeUpdate).toBe('function');
    });
 
@@ -465,5 +591,185 @@ describe('state machine — action availability', () => {
       expect(player.playbackRate).toBe(1);
       expect(player.loopMode).toBe(LoopMode.Off);
       expect(player.error).toBeNull();
+   });
+});
+
+describe('event channel routing', () => {
+   it('onStateChanged receives state-changed payloads', async () => {
+      const events: StateChange[] = [],
+            player = await getPlayer(),
+            unlisten = await player.onStateChanged((change) => { events.push(change); });
+
+      fireEvent('tauri-plugin-audio:state-changed', { status: PlaybackStatus.Playing, error: null });
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toEqual({ status: PlaybackStatus.Playing, error: null });
+
+      unlisten();
+   });
+
+   it('onTrackChanged receives track-changed payloads', async () => {
+      const events: TrackChange[] = [],
+            player = await getPlayer(),
+            unlisten = await player.onTrackChanged((change) => { events.push(change); }),
+            item: PlaylistItem = { src: 'a.mp3', metadata: { title: 'A' } };
+
+      fireEvent('tauri-plugin-audio:track-changed', {
+         currentIndex: 1,
+         duration: 120,
+         item,
+      });
+
+      expect(events).toHaveLength(1);
+      expect(events[0].currentIndex).toBe(1);
+      expect(events[0].duration).toBe(120);
+      expect(events[0].item.src).toBe('a.mp3');
+
+      unlisten();
+   });
+
+   it('onSettingsChanged receives partial settings deltas', async () => {
+      const events: SettingsChange[] = [],
+            player = await getPlayer(),
+            unlisten = await player.onSettingsChanged((change) => { events.push(change); });
+
+      fireEvent('tauri-plugin-audio:settings-changed', { volume: 0.5 });
+      fireEvent('tauri-plugin-audio:settings-changed', { muted: true });
+
+      expect(events).toEqual([ { volume: 0.5 }, { muted: true } ]);
+
+      unlisten();
+   });
+
+   it('onTimeUpdate receives time-update payloads', async () => {
+      const events: TimeUpdate[] = [],
+            player = await getPlayer(),
+            unlisten = await player.onTimeUpdate((time) => { events.push(time); });
+
+      fireEvent('tauri-plugin-audio:time-update', { currentTime: 42, duration: 120 });
+
+      expect(events).toEqual([ { currentTime: 42, duration: 120 } ]);
+
+      unlisten();
+   });
+
+   it('events on one channel do not leak to other channels', async () => {
+      const stateEvents: StateChange[] = [],
+            trackEvents: TrackChange[] = [],
+            settingsEvents: SettingsChange[] = [],
+            timeEvents: TimeUpdate[] = [],
+            player = await getPlayer(),
+            unlistenState = await player.onStateChanged((c) => { stateEvents.push(c); }),
+            unlistenTrack = await player.onTrackChanged((c) => { trackEvents.push(c); }),
+            unlistenSettings = await player.onSettingsChanged((c) => { settingsEvents.push(c); }),
+            unlistenTime = await player.onTimeUpdate((c) => { timeEvents.push(c); });
+
+      fireEvent('tauri-plugin-audio:settings-changed', { volume: 0.7 });
+
+      expect(settingsEvents).toHaveLength(1);
+      expect(stateEvents).toHaveLength(0);
+      expect(trackEvents).toHaveLength(0);
+      expect(timeEvents).toHaveLength(0);
+
+      unlistenState();
+      unlistenTrack();
+      unlistenSettings();
+      unlistenTime();
+   });
+
+   it('emits the expected sequence for a navigation: state Loading → state Ready → track', async () => {
+      const channelLog: string[] = [],
+            player = await getPlayer(),
+            unlistenState = await player.onStateChanged((c) => { channelLog.push(`state:${c.status}`); }),
+            unlistenTrack = await player.onTrackChanged(() => { channelLog.push('track'); }),
+            item: PlaylistItem = { src: 'b.mp3' };
+
+      fireEvent('tauri-plugin-audio:state-changed', { status: PlaybackStatus.Loading, error: null });
+      fireEvent('tauri-plugin-audio:state-changed', { status: PlaybackStatus.Ready, error: null });
+      fireEvent('tauri-plugin-audio:track-changed', { currentIndex: 1, duration: 90, item });
+
+      expect(channelLog).toEqual([ 'state:loading', 'state:ready', 'track' ]);
+
+      unlistenState();
+      unlistenTrack();
+   });
+});
+
+describe('PluginEventManager lifecycle', () => {
+   it('reuses a single global listener across multiple subscribers', async () => {
+      const player = await getPlayer(),
+            before = eventState.listenCalls,
+            unlisten1 = await player.onStateChanged(noop),
+            unlisten2 = await player.onStateChanged(noop),
+            unlisten3 = await player.onStateChanged(noop);
+
+      // All three subscribers share one underlying `listen()` call.
+      expect(eventState.listenCalls - before).toBe(1);
+
+      unlisten1();
+      unlisten2();
+      unlisten3();
+   });
+
+   it('fans out a single event to multiple subscribers', async () => {
+      let aCalls = 0,
+          bCalls = 0;
+
+      const player = await getPlayer(),
+            unlisten1 = await player.onStateChanged(() => { aCalls += 1; }),
+            unlisten2 = await player.onStateChanged(() => { bCalls += 1; });
+
+      fireEvent('tauri-plugin-audio:state-changed', { status: PlaybackStatus.Playing, error: null });
+
+      expect(aCalls).toBe(1);
+      expect(bCalls).toBe(1);
+
+      unlisten1();
+      unlisten2();
+   });
+
+   it('tears down the global listener when the last subscriber unsubscribes', async () => {
+      const player = await getPlayer(),
+            before = eventState.listenCalls,
+            unlisten1 = await player.onStateChanged(noop);
+
+      // Tear down — next subscribe should re-`listen()`.
+      unlisten1();
+
+      const unlisten2 = await player.onStateChanged(noop);
+
+      expect(eventState.listenCalls - before).toBe(2);
+
+      unlisten2();
+   });
+
+   it('only tears down once all subscribers have unsubscribed', async () => {
+      const events: StateChange[] = [],
+            player = await getPlayer(),
+            unlisten1 = await player.onStateChanged(noop),
+            unlisten2 = await player.onStateChanged((c) => { events.push(c); });
+
+      // Drop one subscriber. The other should still receive events.
+      unlisten1();
+
+      fireEvent('tauri-plugin-audio:state-changed', { status: PlaybackStatus.Paused, error: null });
+
+      expect(events).toHaveLength(1);
+
+      unlisten2();
+   });
+
+   it('dedupes concurrent addListener calls during pending setup', async () => {
+      // Two `addListener` calls in flight before the first one's setup
+      // promise resolves should share the single `_pendingSetup`.
+      const player = await getPlayer(),
+            before = eventState.listenCalls,
+            pending = [ player.onStateChanged(noop), player.onStateChanged(noop) ],
+            [ unlisten1, unlisten2 ] = await Promise.all(pending);
+
+      expect(eventState.listenCalls - before).toBe(1);
+
+      unlisten1();
+      unlisten2();
    });
 });

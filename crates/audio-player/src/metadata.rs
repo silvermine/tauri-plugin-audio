@@ -113,6 +113,15 @@ mod tests {
    }
 
    #[test]
+   fn returns_none_for_corrupt_id3_header() {
+      // ID3v2 magic followed by garbage version / flags / size bytes. The
+      // parser should fail with a non-`NoTag` error and we should swallow it
+      // and return `None` rather than propagating or panicking.
+      let bytes = b"ID3\xff\xff\xff\xff\xff\xff\xff trailing junk";
+      assert!(extract(bytes).is_none());
+   }
+
+   #[test]
    fn extracts_title_and_artist() {
       let mut tag = Tag::new();
 

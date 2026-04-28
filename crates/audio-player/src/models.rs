@@ -120,14 +120,59 @@ impl PlayerState {
 
 /// Lightweight time update payload emitted at high frequency during playback.
 ///
-/// Separated from [`PlayerState`] to avoid serializing the full state on every
-/// tick (typically every 250ms). The real implementation emits this via the
-/// `tauri-plugin-audio:time-update` event.
+/// Emitted by the playback monitor (~250 ms tick) and by user-initiated
+/// `seek` so consumers learn about position changes from a single channel.
+/// Carried on the `tauri-plugin-audio:time-update` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeUpdate {
    pub current_time: f64,
    pub duration: f64,
+}
+
+/// Status / error transition payload.
+///
+/// Carried on the `tauri-plugin-audio:state-changed` event. Fires only on
+/// state-machine transitions; settings, navigation, and time updates have
+/// their own channels. Compact by design — the playlist is never on this
+/// channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateChange {
+   pub status: PlaybackStatus,
+   pub error: Option<String>,
+}
+
+/// Active-track navigation payload.
+///
+/// Carried on the `tauri-plugin-audio:track-changed` event. Fires after
+/// `load_inner` finishes for any item — initial load, navigation, or
+/// auto-advance — and carries the active [`PlaylistItem`] with its
+/// freshly-merged ID3 metadata. This is the canonical channel for
+/// per-item metadata enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackChange {
+   pub current_index: usize,
+   pub duration: f64,
+   pub item: PlaylistItem,
+}
+
+/// Partial settings update payload.
+///
+/// Carried on the `tauri-plugin-audio:settings-changed` event. Only the
+/// field whose value the caller mutated is set; absent fields are unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsChange {
+   #[serde(skip_serializing_if = "Option::is_none")]
+   pub volume: Option<f64>,
+   #[serde(skip_serializing_if = "Option::is_none")]
+   pub muted: Option<bool>,
+   #[serde(skip_serializing_if = "Option::is_none")]
+   pub playback_rate: Option<f64>,
+   #[serde(skip_serializing_if = "Option::is_none")]
+   pub loop_mode: Option<LoopMode>,
 }
 
 /// Response from a transport action (prepare, play, pause, stop, seek, next, prev).

@@ -10,9 +10,11 @@ mod commands;
 
 pub use audio_player::{
    AudioActionResponse, AudioMetadata, LoopMode, PlaybackStatus, PlayerState, PlaylistItem,
-   TimeUpdate,
+   SettingsChange, StateChange, TimeUpdate, TrackChange,
 };
-pub use audio_player::{Error, OnChanged, OnTimeUpdate, Result, RodioAudioPlayer};
+pub use audio_player::{
+   Error, OnSettingsChanged, OnStateChanged, OnTimeUpdate, OnTrackChanged, Result, RodioAudioPlayer,
+};
 
 /// Extensions to [`tauri::App`], [`tauri::AppHandle`] and [`tauri::Window`] to access
 /// the audio player APIs.
@@ -50,12 +52,24 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
       ])
       .setup(|app_handle, _api| {
          let state_handle = app_handle.clone();
+         let track_handle = app_handle.clone();
+         let settings_handle = app_handle.clone();
          let time_handle = app_handle.clone();
 
          let player = RodioAudioPlayer::new(
-            Arc::new(move |state| {
-               if let Err(e) = state_handle.emit("tauri-plugin-audio:state-changed", state) {
+            Arc::new(move |change| {
+               if let Err(e) = state_handle.emit("tauri-plugin-audio:state-changed", change) {
                   warn!("Failed to emit state-changed event: {}", e);
+               }
+            }),
+            Arc::new(move |change| {
+               if let Err(e) = track_handle.emit("tauri-plugin-audio:track-changed", change) {
+                  warn!("Failed to emit track-changed event: {}", e);
+               }
+            }),
+            Arc::new(move |change| {
+               if let Err(e) = settings_handle.emit("tauri-plugin-audio:settings-changed", change) {
+                  warn!("Failed to emit settings-changed event: {}", e);
                }
             }),
             Arc::new(move |time| {

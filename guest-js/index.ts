@@ -14,23 +14,28 @@ export { attachPlayer };
  *
  * @example
  * ```ts
- * import { getPlayer, PlaybackStatus, hasAction, AudioAction }
- *    from '@silvermine/tauri-plugin-audio';
+ * import { getPlayer, PlaybackStatus } from '@silvermine/tauri-plugin-audio';
  *
  * const player = await getPlayer();
  *
  * if (player.status === PlaybackStatus.Idle) {
- *    const { player: ready } = await player.load('https://example.com/song.mp3', {
- *       title: 'My Song',
- *       artist: 'Artist Name',
- *    });
- *    const { player: playing } = await ready.play();
- *    console.log('Now playing:', playing.title);
+ *    const { player: ready } = await player.load([
+ *       {
+ *          src: 'https://example.com/song.mp3',
+ *          metadata: { title: 'My Song', artist: 'Artist Name' },
+ *       },
+ *    ]);
+ *    await ready.play();
  * }
  *
- * // Listen for state changes (e.g. time progression):
- * const unlisten = await player.listen((updated) => {
- *    console.log('Time:', updated.currentTime, '/', updated.duration);
+ * // Listen for active-track changes (e.g. on auto-advance):
+ * const unlistenTrack = await player.onTrackChanged((change) => {
+ *    console.log('Now playing:', change.item.metadata?.title);
+ * });
+ *
+ * // Listen for playback-position updates (~250ms during playback):
+ * const unlistenTime = await player.onTimeUpdate((time) => {
+ *    console.log('Time:', time.currentTime, '/', time.duration);
  * });
  * ```
  */

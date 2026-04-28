@@ -156,6 +156,36 @@ pub fn pause(state: &mut PlayerState) -> Result<()> {
    Ok(())
 }
 
+/// Asserts that `state.status` matches `expected`, returning [`Error::InvalidState`]
+/// otherwise.
+///
+/// Used by the auto-advance path to abort cleanly if the user changed state
+/// (paused, stopped) between end-of-track detection and re-acquiring the
+/// player lock.
+pub fn assert_status(state: &PlayerState, expected: PlaybackStatus) -> Result<()> {
+   if state.status != expected {
+      return Err(Error::InvalidState(format!(
+         "Expected {:?}, got {:?}",
+         expected, state.status
+      )));
+   }
+   Ok(())
+}
+
+/// Transitions `Ready` to `Paused`. Used after [`load`] completes for an
+/// inter-track move so that pause intent is preserved across navigation
+/// (`prev`, `next`, `jumpTo`) when the player was paused before the move.
+pub fn pause_after_load(state: &mut PlayerState) -> Result<()> {
+   if state.status != PlaybackStatus::Ready {
+      return Err(Error::InvalidState(format!(
+         "Cannot pause-after-load in {:?} state",
+         state.status
+      )));
+   }
+   state.status = PlaybackStatus::Paused;
+   Ok(())
+}
+
 /// Validates and applies the stop transition, preserving user settings.
 ///
 /// Allowed from any non-`Idle` status, including `Error`, so users can
@@ -619,6 +649,34 @@ mod tests {
    }
 
    #[test]
+   fn pause_after_load_from_ready() {
+      let mut s = loaded_state(PlaybackStatus::Ready, 1, 0);
+      pause_after_load(&mut s).unwrap();
+      assert_eq!(s.status, PlaybackStatus::Paused);
+   }
+
+   #[test]
+   fn pause_after_load_rejected_from_playing() {
+      let mut s = loaded_state(PlaybackStatus::Playing, 1, 0);
+      assert!(pause_after_load(&mut s).is_err());
+   }
+
+   #[test]
+   fn assert_status_passes_when_matching() {
+      let s = loaded_state(PlaybackStatus::Playing, 1, 0);
+      assert!(assert_status(&s, PlaybackStatus::Playing).is_ok());
+   }
+
+   #[test]
+   fn assert_status_fails_when_status_diverges() {
+      // Simulates the auto-advance race: the monitor expected Playing but
+      // the user paused between end-of-track detection and re-acquiring
+      // the lock. The auto-advance must abort.
+      let s = loaded_state(PlaybackStatus::Paused, 1, 0);
+      assert!(assert_status(&s, PlaybackStatus::Playing).is_err());
+   }
+
+   #[test]
    fn stop_clears_playlist_preserves_settings() {
       let mut s = loaded_state(PlaybackStatus::Playing, 3, 1);
       s.volume = 0.5;
@@ -784,6 +842,23 @@ mod tests {
    fn prev_target_restarts_current_when_past_3s() {
       let mut s = loaded_state(PlaybackStatus::Playing, 3, 1);
       s.current_time = 10.0;
+      assert_eq!(prev_target(&s).unwrap(), NavTarget::RestartCurrent);
+   }
+
+   #[test]
+   fn prev_target_at_exactly_3s_moves_back() {
+      // The 3-second rule uses `> 3.0`, so the boundary itself moves to
+      // the previous item rather than restarting. Pin this behaviour so
+      // the inclusive/exclusive intent doesn't drift.
+      let mut s = loaded_state(PlaybackStatus::Playing, 3, 1);
+      s.current_time = 3.0;
+      assert_eq!(prev_target(&s).unwrap(), NavTarget::Index(0));
+   }
+
+   #[test]
+   fn prev_target_just_past_3s_restarts() {
+      let mut s = loaded_state(PlaybackStatus::Playing, 3, 1);
+      s.current_time = 3.0001;
       assert_eq!(prev_target(&s).unwrap(), NavTarget::RestartCurrent);
    }
 

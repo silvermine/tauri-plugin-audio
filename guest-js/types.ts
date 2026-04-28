@@ -182,13 +182,50 @@ export interface AllAudioActions {
 }
 
 /**
- * Lightweight time update payload emitted at high frequency during
- * playback (typically every 250ms). Separated from full state changes
- * to minimize serialization overhead.
+ * Lightweight time update payload. Emitted by the playback monitor (~250 ms
+ * tick) and by user-initiated `seek` so consumers learn about position
+ * changes from a single channel regardless of source.
  */
 export interface TimeUpdate {
    currentTime: number;
    duration: number;
+}
+
+/**
+ * Status / error transition payload carried on `state-changed` events.
+ *
+ * Compact by design — fires only when the state-machine status (or its
+ * accompanying error message) changes. Settings, navigation, and time
+ * updates have their own channels.
+ */
+export interface StateChange {
+   status: PlaybackStatus;
+   error: string | null;
+}
+
+/**
+ * Active-track payload carried on `track-changed` events.
+ *
+ * Fires after each item finishes loading (initial load, navigation, or
+ * auto-advance) and carries the freshly-enriched {@link PlaylistItem} so
+ * consumers receive ID3-merged title / artist / artwork without having
+ * to query the playlist.
+ */
+export interface TrackChange {
+   currentIndex: number;
+   duration: number;
+   item: PlaylistItem;
+}
+
+/**
+ * Partial settings update carried on `settings-changed` events. Only the
+ * field whose value changed is set; absent fields are unchanged.
+ */
+export interface SettingsChange {
+   volume?: number;
+   muted?: boolean;
+   playbackRate?: number;
+   loopMode?: LoopMode;
 }
 
 /**
@@ -198,19 +235,32 @@ export interface TimeUpdate {
 export interface PlayerControls {
 
    /**
-    * Listen for changes to the player state. To avoid memory leaks,
-    * call the `unlisten` function returned by the promise when no
-    * longer needed.
+    * Listen for state-machine transitions (status / error changes). To avoid
+    * memory leaks, call the `unlisten` function returned by the promise
+    * when no longer needed.
     *
-    * Receives updates for state transitions (status changes, volume,
-    * settings, errors). For high-frequency time progression, use
-    * {@link onTimeUpdate} instead.
+    * For navigation between playlist items use {@link onTrackChanged}; for
+    * settings mutations use {@link onSettingsChanged}; for high-frequency
+    * position updates use {@link onTimeUpdate}.
     */
-   listen: (listener: (player: PlayerWithAnyStatus) => void) => Promise<UnlistenFn>;
+   onStateChanged: (listener: (change: StateChange) => void) => Promise<UnlistenFn>;
 
    /**
-    * Listen for high-frequency time progression updates during
-    * playback (typically every 250ms).
+    * Listen for active-track changes. Fires after each item finishes loading
+    * with the enriched {@link PlaylistItem} (title / artist / artwork merged
+    * from any embedded ID3 metadata).
+    */
+   onTrackChanged: (listener: (change: TrackChange) => void) => Promise<UnlistenFn>;
+
+   /**
+    * Listen for settings mutations (`volume`, `muted`, `playbackRate`,
+    * `loopMode`). Only the changed field is set on the payload.
+    */
+   onSettingsChanged: (listener: (change: SettingsChange) => void) => Promise<UnlistenFn>;
+
+   /**
+    * Listen for playback-position updates (~250 ms during playback, plus
+    * one-shot updates from user-initiated `seek`).
     */
    onTimeUpdate: (listener: (time: TimeUpdate) => void) => Promise<UnlistenFn>;
 
@@ -286,9 +336,8 @@ export const allowedActions = {
       AudioAction.JumpTo,
    ],
    // From Error, the user can either reload the entire playlist or skip
-   // past the broken item via next/prev/jumpTo (preserving the rest of the
-   // playlist and the source-bytes cache for items that already loaded).
-   // Stop is also allowed so consumers can tear down cleanly.
+   // past the broken item via next/prev/jumpTo (the rest of the playlist
+   // is preserved). Stop is also allowed so consumers can tear down cleanly.
    [PlaybackStatus.Error]: [
       AudioAction.Load,
       AudioAction.Stop,
@@ -309,27 +358,32 @@ export const expectedStatusesForAction = {
       PlaybackStatus.Paused,
       PlaybackStatus.Ended,
    ],
-   // `next` ends in Ready (advanced from Ready/Paused), Playing (advanced from
-   // Playing — auto-resume on the new item), or Ended (fell off the end of a
-   // non-looping playlist). Pause is not preserved through advancement.
+   // `next` advances to the next item, preserving the prior status (Ready /
+   // Playing / Paused), or transitions to Ended when falling off the end of a
+   // non-looping playlist.
    [AudioAction.Next]: [
       PlaybackStatus.Ready,
       PlaybackStatus.Playing,
+      PlaybackStatus.Paused,
       PlaybackStatus.Ended,
    ],
-   // `prev` either restarts the current item (preserves Ready/Playing/Paused)
-   // or advances to a previous item (Ready or Playing).
+   // `prev` either restarts the current item (preserves Ready/Playing/Paused,
+   // or stays Ended if invoked from Ended after the >3s threshold) or advances
+   // to a previous item (preserves Ready/Playing/Paused).
    [AudioAction.Prev]: [
       PlaybackStatus.Ready,
       PlaybackStatus.Playing,
       PlaybackStatus.Paused,
+      PlaybackStatus.Ended,
    ],
-   // `jumpTo` either restarts the current item (preserves Ready/Playing/Paused)
-   // or jumps to a different item (Ready or Playing).
+   // `jumpTo` either restarts the current item (preserves Ready/Playing/Paused,
+   // or stays Ended if jumping to the current index from Ended) or jumps to a
+   // different item (preserves Ready/Playing/Paused).
    [AudioAction.JumpTo]: [
       PlaybackStatus.Ready,
       PlaybackStatus.Playing,
       PlaybackStatus.Paused,
+      PlaybackStatus.Ended,
    ],
 } as const satisfies Record<AudioAction, PlaybackStatus[]>;
 

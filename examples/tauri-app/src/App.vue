@@ -217,7 +217,7 @@
                   <input type="checkbox" v-model="showTimeUpdates" />
                   Time updates
                </label>
-               <button class="event-clear-btn" @click="eventLog = []; lastStateSnapshot = null">Clear</button>
+               <button class="event-clear-btn" @click="eventLog = []">Clear</button>
             </div>
          </div>
          <div class="event-log-entries" ref="eventLogEl">
@@ -241,18 +241,25 @@
 import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
 import './style.css';
 import {
+   attachPlayer,
    getPlayer,
    PlaybackStatus,
    LoopMode,
    hasAction,
    AudioAction,
 } from '@silvermine/tauri-plugin-audio';
-import type { PlayerWithAnyStatus, PlaylistItem } from '@silvermine/tauri-plugin-audio';
+import type {
+   PlayerState,
+   PlayerWithAnyStatus,
+   PlaylistItem,
+   SettingsChange,
+   StateChange,
+   TrackChange,
+} from '@silvermine/tauri-plugin-audio';
 
 const KALIMBA_SRC = 'https://www.learningcontainer.com/wp-content/uploads/2020/02/Kalimba.mp3';
 
 /// Default text shown in the playlist textarea on first load.
-/// Auto-parsed and loaded once the player is ready in `onMounted`.
 const DEFAULT_PLAYLIST_TEXT = [ KALIMBA_SRC, KALIMBA_SRC, KALIMBA_SRC ].join('\n');
 
 const player = ref<PlayerWithAnyStatus | null>(null);
@@ -279,12 +286,16 @@ const speedOptions = [
 ];
 
 let unlistenState: (() => void) | null = null;
+let unlistenTrack: (() => void) | null = null;
+let unlistenSettings: (() => void) | null = null;
 let unlistenTime: (() => void) | null = null;
 
 const MAX_LOG_ENTRIES = 200;
 
+type EventChannel = 'state' | 'track' | 'settings' | 'time';
+
 interface EventLogEntry {
-   type: 'state' | 'time';
+   type: EventChannel;
    label: string;
    summary: string;
    timestamp: string;
@@ -295,10 +306,9 @@ interface EventLogEntry {
 const eventLog = ref<EventLogEntry[]>([]);
 const showTimeUpdates = ref(false);
 const eventLogEl = ref<HTMLElement | null>(null);
-let lastStateSnapshot: Record<string, unknown> | null = null;
 
 const filteredEvents = computed(() => {
-   return showTimeUpdates.value ? eventLog.value : eventLog.value.filter((e) => e.type === 'state');
+   return showTimeUpdates.value ? eventLog.value : eventLog.value.filter((e) => e.type !== 'time');
 });
 
 function parsePlaylist(text: string): PlaylistItem[] {
@@ -333,55 +343,34 @@ function pushEvent(entry: EventLogEntry): void {
    });
 }
 
-function summarizeStateChange(updated: PlayerWithAnyStatus): string {
-   const curr: Record<string, unknown> = { ...updated };
-   const prev = lastStateSnapshot;
+function summarizeState(change: StateChange): string {
+   return change.error ? `${change.status} (${change.error})` : change.status;
+}
+
+function summarizeTrack(change: TrackChange): string {
+   const total = player.value?.playlist.length ?? 0;
+   const idx = change.currentIndex + 1;
+   const name = change.item.metadata?.title || change.item.src.split('/').pop() || 'Unknown';
+
+   return total > 0 ? `${idx}/${total} — ${name}` : name;
+}
+
+function summarizeSettings(change: SettingsChange): string {
    const parts: string[] = [];
 
-   if (!prev || prev.status !== curr.status) {
-      parts.push(prev ? `${prev.status} → ${curr.status}` : `${curr.status}`);
+   if (change.volume !== undefined) {
+      parts.push(`volume: ${Math.round(change.volume * 100)}%`);
    }
-
-   if (!prev || prev.currentIndex !== curr.currentIndex) {
-      const item = updated.currentIndex !== null ? updated.playlist[updated.currentIndex] : null;
-      const name = item?.metadata?.title || item?.src.split('/').pop() || null;
-
-      if (name) {
-         const total = updated.playlist.length;
-         const idx = (updated.currentIndex ?? 0) + 1;
-
-         parts.push(`${idx}/${total} — ${name}`);
-      }
+   if (change.muted !== undefined) {
+      parts.push(change.muted ? 'muted' : 'unmuted');
    }
-
-   if (prev) {
-      if (prev.volume !== curr.volume) {
-         parts.push(`volume: ${Math.round((curr.volume as number) * 100)}%`);
-      }
-      if (prev.muted !== curr.muted) {
-         parts.push(curr.muted ? 'muted' : 'unmuted');
-      }
-      if (prev.playbackRate !== curr.playbackRate) {
-         parts.push(`rate: ${curr.playbackRate}x`);
-      }
-      if (prev.loopMode !== curr.loopMode) {
-         parts.push(`loop: ${curr.loopMode}`);
-      }
-      if (prev.duration !== curr.duration && (curr.duration as number) > 0) {
-         parts.push(`duration: ${formatTime(curr.duration as number)}`);
-      }
-      if (prev.currentTime !== curr.currentTime && prev.status === curr.status) {
-         parts.push(`seek: ${formatTime(curr.currentTime as number)}`);
-      }
+   if (change.playbackRate !== undefined) {
+      parts.push(`rate: ${change.playbackRate}x`);
    }
-
-   lastStateSnapshot = curr;
-
-   if (parts.length === 0) {
-      return `${updated.status} · ${formatTime(updated.currentTime)}`;
+   if (change.loopMode !== undefined) {
+      parts.push(`loop: ${change.loopMode}`);
    }
-
-   return parts.join(' · ');
+   return parts.join(' · ') || '(no change)';
 }
 
 // -- Computed --
@@ -400,11 +389,8 @@ const trackTitle = computed(() => {
       return 'No track loaded';
    }
    const item = currentItem.value;
-   const title = item?.metadata?.title || item?.src.split('/').pop() || 'Unknown';
-   const total = player.value.playlist.length;
-   const idx = (player.value.currentIndex ?? 0) + 1;
 
-   return total > 1 ? `${idx}/${total} — ${title}` : title;
+   return item?.metadata?.title || item?.src.split('/').pop() || 'Unknown';
 });
 
 const progressValue = computed(() => {
@@ -546,6 +532,7 @@ async function next(): Promise<void> {
       const resp = await player.value.next();
 
       player.value = resp.player;
+      duration.value = resp.player.duration;
    } catch (e) {
       errorMessage.value = `${e}`;
    }
@@ -559,6 +546,7 @@ async function prev(): Promise<void> {
       const resp = await player.value.prev();
 
       player.value = resp.player;
+      duration.value = resp.player.duration;
    } catch (e) {
       errorMessage.value = `${e}`;
    }
@@ -572,6 +560,7 @@ async function jumpTo(index: number): Promise<void> {
       const resp = await player.value.jumpTo(index);
 
       player.value = resp.player;
+      duration.value = resp.player.duration;
    } catch (e) {
       errorMessage.value = `${e}`;
    }
@@ -657,26 +646,110 @@ async function stopPlayback(): Promise<void> {
 
 // -- Lifecycle --
 
+/**
+ * Apply per-channel deltas to the canonical `player.value` object,
+ * re-running `attachPlayer` so the gated transport methods reflect the
+ * latest status. Each helper extracts a fresh `PlayerState` record from
+ * the current player, applies the delta, then re-attaches.
+ */
+function applyState(change: StateChange): void {
+   if (!player.value) {
+      return;
+   }
+   const next: PlayerState<PlaybackStatus> = {
+      ...player.value,
+      status: change.status,
+      error: change.error,
+   };
+
+   player.value = attachPlayer(next);
+}
+
+function applyTrack(change: TrackChange): void {
+   if (!player.value) {
+      return;
+   }
+   const playlist = [ ...player.value.playlist ];
+
+   playlist[change.currentIndex] = change.item;
+   const next: PlayerState<PlaybackStatus> = {
+      ...player.value,
+      currentIndex: change.currentIndex,
+      duration: change.duration,
+      playlist,
+   };
+
+   player.value = attachPlayer(next);
+   currentTime.value = 0;
+   duration.value = change.duration;
+}
+
+function applySettings(change: SettingsChange): void {
+   if (!player.value) {
+      return;
+   }
+   const next: PlayerState<PlaybackStatus> = {
+      ...player.value,
+      ...(change.volume !== undefined && { volume: change.volume }),
+      ...(change.muted !== undefined && { muted: change.muted }),
+      ...(change.playbackRate !== undefined && { playbackRate: change.playbackRate }),
+      ...(change.loopMode !== undefined && { loopMode: change.loopMode }),
+   };
+
+   player.value = attachPlayer(next);
+}
+
 onMounted(async () => {
    document.addEventListener('click', onClickOutside);
 
    const p = await getPlayer();
 
    player.value = p;
+   currentTime.value = p.currentTime;
+   duration.value = p.duration;
 
-   unlistenState = await p.listen((updated) => {
-      player.value = updated;
-      currentTime.value = updated.currentTime;
-      if (updated.status === PlaybackStatus.Idle) {
+   // If a playlist is already loaded server-side (e.g. the page reloaded
+   // mid-playback), seed the textarea with the loaded sources so the UI
+   // reflects what's playing rather than the default.
+   if (p.playlist.length > 0) {
+      playlistText.value = p.playlist.map((item) => { return item.src; }).join('\n');
+   }
+
+   unlistenState = await p.onStateChanged((change) => {
+      applyState(change);
+      if (change.status === PlaybackStatus.Idle) {
          seekPreviewTime.value = null;
       }
-      duration.value = updated.duration;
       pushEvent({
          type: 'state',
-         label: updated.status,
-         summary: summarizeStateChange(updated),
+         label: change.status,
+         summary: summarizeState(change),
          timestamp: formatTimestamp(),
-         payload: JSON.stringify(updated, null, 2),
+         payload: JSON.stringify(change, null, 2),
+         expanded: false,
+      });
+   });
+
+   unlistenTrack = await p.onTrackChanged((change) => {
+      applyTrack(change);
+      pushEvent({
+         type: 'track',
+         label: 'track',
+         summary: summarizeTrack(change),
+         timestamp: formatTimestamp(),
+         payload: JSON.stringify(change, null, 2),
+         expanded: false,
+      });
+   });
+
+   unlistenSettings = await p.onSettingsChanged((change) => {
+      applySettings(change);
+      pushEvent({
+         type: 'settings',
+         label: 'settings',
+         summary: summarizeSettings(change),
+         timestamp: formatTimestamp(),
+         payload: JSON.stringify(change, null, 2),
          expanded: false,
       });
    });
@@ -696,28 +769,13 @@ onMounted(async () => {
       });
    });
 
-   // Auto-load whatever is in the textarea on first mount so the demo is
-   // ready to play without an extra click. The textarea remains editable.
-   const initialItems = parsePlaylist(playlistText.value);
-
-   if (initialItems.length > 0 && hasAction(p, AudioAction.Load)) {
-      try {
-         isLoading.value = true;
-         const resp = await p.load(initialItems);
-
-         player.value = resp.player;
-         duration.value = resp.player.duration;
-      } catch (e) {
-         errorMessage.value = `Failed to preload: ${e}`;
-      } finally {
-         isLoading.value = false;
-      }
-   }
 });
 
 onUnmounted(() => {
    document.removeEventListener('click', onClickOutside);
    unlistenState?.();
+   unlistenTrack?.();
+   unlistenSettings?.();
    unlistenTime?.();
 });
 </script>
@@ -1218,6 +1276,16 @@ h1 {
 .event-badge.state {
    background: rgba(10, 132, 255, 0.2);
    color: #0a84ff;
+}
+
+.event-badge.track {
+   background: rgba(48, 209, 88, 0.18);
+   color: #30d158;
+}
+
+.event-badge.settings {
+   background: rgba(255, 159, 10, 0.18);
+   color: #ff9f0a;
 }
 
 .event-badge.time {

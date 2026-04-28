@@ -3,7 +3,8 @@ import { addPluginListener, invoke } from '@tauri-apps/api/core';
 import {
    AllAudioActions, AudioAction, AudioActionResponse, LoopMode,
    Player, PlayerControls, PlayerState, PlaybackStatus, PlaylistItem,
-   PlayerWithAnyStatus, TimeUpdate, allowedActions,
+   PlayerWithAnyStatus, SettingsChange, StateChange, TimeUpdate,
+   TrackChange, allowedActions,
 } from './types';
 
 /**
@@ -101,14 +102,28 @@ class PluginEventManager<TRaw, TOut> {
    }
 }
 
-/** State-change events: status transitions, settings, errors. */
-const audioEventManager = new PluginEventManager<PlayerState<PlaybackStatus>, PlayerWithAnyStatus>(
+/** State-machine transitions (status + error). */
+const stateEventManager = new PluginEventManager<StateChange, StateChange>(
    'state-changed',
    'tauri-plugin-audio:state-changed',
-   (event) => { return attachPlayer(event); }
+   (event) => { return event; }
 );
 
-/** High-frequency time-update events (~250ms during playback). */
+/** Active-track changes (carries the enriched playlist item). */
+const trackEventManager = new PluginEventManager<TrackChange, TrackChange>(
+   'track-changed',
+   'tauri-plugin-audio:track-changed',
+   (event) => { return event; }
+);
+
+/** Settings deltas (only the changed field is set). */
+const settingsEventManager = new PluginEventManager<SettingsChange, SettingsChange>(
+   'settings-changed',
+   'tauri-plugin-audio:settings-changed',
+   (event) => { return event; }
+);
+
+/** High-frequency time-update events (~250 ms during playback) plus seek hits. */
 const timeUpdateEventManager = new PluginEventManager<TimeUpdate, TimeUpdate>(
    'time-update',
    'tauri-plugin-audio:time-update',
@@ -116,18 +131,27 @@ const timeUpdateEventManager = new PluginEventManager<TimeUpdate, TimeUpdate>(
 );
 
 /**
- * Maps a TypeScript-side action name (camelCase) to its Tauri command name
- * (snake_case). Single-word actions like `load` pass through unchanged.
+ * Maps each {@link AudioAction} to the snake_case Tauri command name
+ * registered in the plugin's permissions.
  */
-function ipcCommand(action: AudioAction): string {
-   return action.replace(/[A-Z]/g, (c) => { return `_${c.toLowerCase()}`; });
-}
+const actionCommands: Record<AudioAction, string> = {
+   [AudioAction.Load]: 'load',
+   [AudioAction.Play]: 'play',
+   [AudioAction.Pause]: 'pause',
+   [AudioAction.Stop]: 'stop',
+   [AudioAction.Seek]: 'seek',
+   [AudioAction.Next]: 'next',
+   [AudioAction.Prev]: 'prev',
+   [AudioAction.JumpTo]: 'jump_to',
+};
 
 async function sendAction<A extends AudioAction>(
    action: A,
    args: Record<string, unknown>
 ): Promise<AudioActionResponse<A>> {
-   const response = await invoke<AudioActionResponse<A>>(`plugin:audio|${ipcCommand(action)}`, args);
+   const command = actionCommands[action];
+
+   const response = await invoke<AudioActionResponse<A>>(`plugin:audio|${command}`, args);
 
    response.player = attachPlayer(response.player);
    return response;
@@ -177,8 +201,16 @@ const transportActions = {
 } satisfies AllAudioActions;
 
 const playerControls = {
-   listen(listener: (player: PlayerWithAnyStatus) => void): Promise<UnlistenFn> {
-      return audioEventManager.addListener(listener);
+   onStateChanged(listener: (change: StateChange) => void): Promise<UnlistenFn> {
+      return stateEventManager.addListener(listener);
+   },
+
+   onTrackChanged(listener: (change: TrackChange) => void): Promise<UnlistenFn> {
+      return trackEventManager.addListener(listener);
+   },
+
+   onSettingsChanged(listener: (change: SettingsChange) => void): Promise<UnlistenFn> {
+      return settingsEventManager.addListener(listener);
    },
 
    onTimeUpdate(listener: (time: TimeUpdate) => void): Promise<UnlistenFn> {

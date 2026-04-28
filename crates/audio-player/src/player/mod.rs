@@ -16,10 +16,11 @@ use self::source::{SeekStrategy, SourceDescriptor, load_source_descriptor, open_
 
 use crate::error::{Error, Result};
 use crate::models::{
-   AudioActionResponse, LoopMode, PlaybackStatus, PlayerState, PlaylistItem, TimeUpdate,
+   AudioActionResponse, LoopMode, PlaybackStatus, PlayerState, PlaylistItem, SettingsChange,
+   StateChange, TimeUpdate, TrackChange,
 };
 use crate::transitions::NavTarget;
-use crate::{OnChanged, OnTimeUpdate, transitions};
+use crate::{OnSettingsChanged, OnStateChanged, OnTimeUpdate, OnTrackChanged, transitions};
 
 /// Audio player backed by Rodio for cross-platform desktop playback.
 ///
@@ -29,7 +30,9 @@ use crate::{OnChanged, OnTimeUpdate, transitions};
 pub struct RodioAudioPlayer {
    inner: Arc<Mutex<Inner>>,
    output_sink: MixerDeviceSink,
-   on_changed: OnChanged,
+   on_state_changed: OnStateChanged,
+   on_track_changed: OnTrackChanged,
+   on_settings_changed: OnSettingsChanged,
    on_time_update: OnTimeUpdate,
    /// Weak self-reference so the monitor thread can call back without
    /// keeping the player alive after its owner has dropped it.
@@ -57,12 +60,23 @@ struct PlaybackContext {
 impl RodioAudioPlayer {
    /// Creates a new Rodio-backed audio player.
    ///
-   /// Opens the default audio output device. Returns an error
-   /// if no audio device is available.
+   /// Opens the default audio output device. Takes one callback per event channel:
+   ///
+   /// * `on_state_changed` — fires on state-machine transitions.
+   /// * `on_track_changed` — fires after each item is loaded with its enriched metadata.
+   /// * `on_settings_changed` — fires on volume / mute / rate / loop-mode mutations.
+   /// * `on_time_update` — fires on monitor ticks (~250 ms) and seeks.
+   ///
+   /// Returns an error if no audio device is available.
    ///
    /// Returns an `Arc` so the monitor thread can hold a weak self-reference
    /// for auto-advance callbacks.
-   pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Arc<Self>> {
+   pub fn new(
+      on_state_changed: OnStateChanged,
+      on_track_changed: OnTrackChanged,
+      on_settings_changed: OnSettingsChanged,
+      on_time_update: OnTimeUpdate,
+   ) -> Result<Arc<Self>> {
       let mut output_sink = open_audio_output()?;
       output_sink.log_on_drop(false);
 
@@ -75,7 +89,9 @@ impl RodioAudioPlayer {
             seek_generation: 0,
          })),
          output_sink,
-         on_changed,
+         on_state_changed,
+         on_track_changed,
+         on_settings_changed,
          on_time_update,
          weak_self: weak_self.clone(),
       }))
@@ -86,17 +102,45 @@ impl RodioAudioPlayer {
       inner.monitor_stop.store(true, Ordering::Relaxed);
    }
 
-   /// Emits a `state-changed` event with per-item `artwork` data stripped
-   /// from the playlist payload.
-   fn emit_state_changed(&self, snapshot: &PlayerState) {
-      let mut stripped = snapshot.clone();
+   /// Emits a `state-changed` event for a status / error transition.
+   fn emit_state(&self, state: &PlayerState) {
+      (self.on_state_changed)(&StateChange {
+         status: state.status,
+         error: state.error.clone(),
+      });
+   }
 
-      for item in stripped.playlist.iter_mut() {
-         if let Some(meta) = item.metadata.as_mut() {
-            meta.artwork = None;
-         }
-      }
-      (self.on_changed)(&stripped);
+   /// Emits a `track-changed` event for the currently active item. The
+   /// item is cloned out of `state.playlist[current_index]` so consumers
+   /// receive its merged ID3 metadata + artwork. No-op if no playlist
+   /// is loaded.
+   fn emit_track(&self, state: &PlayerState) {
+      let Some(idx) = state.current_index else {
+         return;
+      };
+      let Some(item) = state.playlist.get(idx) else {
+         return;
+      };
+      (self.on_track_changed)(&TrackChange {
+         current_index: idx,
+         duration: state.duration,
+         item: item.clone(),
+      });
+   }
+
+   /// Emits a `settings-changed` event with only the changed field set.
+   fn emit_settings(&self, change: SettingsChange) {
+      (self.on_settings_changed)(&change);
+   }
+
+   /// Emits a `time-update` event. Used by the monitor's tick loop and by
+   /// user-initiated `seek` so consumers get position updates from a
+   /// single channel regardless of source.
+   fn emit_time(&self, current_time: f64, duration: f64) {
+      (self.on_time_update)(&TimeUpdate {
+         current_time,
+         duration,
+      });
    }
 
    /// Spawns a new monitor thread for time updates and end-of-track detection.
@@ -150,7 +194,7 @@ impl RodioAudioPlayer {
             .ok_or_else(|| Error::InvalidState("Missing current item after begin_load".into()))?;
          let snapshot = inner.state.clone();
          drop(inner);
-         self.emit_state_changed(&snapshot);
+         self.emit_state(&snapshot);
          (src, load_generation)
       };
 
@@ -158,7 +202,8 @@ impl RodioAudioPlayer {
 
       match result {
          Ok(snapshot) => {
-            self.emit_state_changed(&snapshot);
+            self.emit_state(&snapshot);
+            self.emit_track(&snapshot);
             Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ready))
          }
          Err(error) => {
@@ -168,7 +213,7 @@ impl RodioAudioPlayer {
             };
 
             if let Some(snapshot) = snapshot {
-               self.emit_state_changed(&snapshot);
+               self.emit_state(&snapshot);
             }
 
             Err(error)
@@ -247,7 +292,13 @@ impl RodioAudioPlayer {
             item.metadata = Some(merged);
          }
 
-         transitions::load(&mut inner.state, duration)?;
+         // Drain queued audio on failure so `Sink::drop` doesn't block the audio
+         // thread waiting for the queue to play out naturally.
+         if let Err(e) = transitions::load(&mut inner.state, duration) {
+            drop(inner);
+            sink.stop();
+            return Err(e);
+         }
 
          Self::stop_monitor(&inner);
 
@@ -333,7 +384,7 @@ impl RodioAudioPlayer {
          )?,
       };
 
-      self.emit_state_changed(&snapshot);
+      self.emit_state(&snapshot);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Playing))
    }
 
@@ -351,7 +402,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      self.emit_state_changed(&snapshot);
+      self.emit_state(&snapshot);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Paused))
    }
 
@@ -372,7 +423,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      self.emit_state_changed(&snapshot);
+      self.emit_state(&snapshot);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Idle))
    }
 
@@ -458,8 +509,10 @@ impl RodioAudioPlayer {
          }
       };
 
+      // Seek doesn't transition status; consumers learn about the new
+      // position via the `time-update` channel.
       let expected = snapshot.status;
-      self.emit_state_changed(&snapshot);
+      self.emit_time(snapshot.current_time, snapshot.duration);
       Ok(AudioActionResponse::new(snapshot, expected))
    }
 
@@ -630,7 +683,10 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      self.emit_state_changed(&snapshot);
+      self.emit_settings(SettingsChange {
+         volume: Some(snapshot.volume),
+         ..SettingsChange::default()
+      });
       Ok(snapshot)
    }
 
@@ -644,7 +700,10 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      self.emit_state_changed(&snapshot);
+      self.emit_settings(SettingsChange {
+         muted: Some(snapshot.muted),
+         ..SettingsChange::default()
+      });
       snapshot
    }
 
@@ -710,7 +769,10 @@ impl RodioAudioPlayer {
          )?,
       };
 
-      self.emit_state_changed(&snapshot);
+      self.emit_settings(SettingsChange {
+         playback_rate: Some(snapshot.playback_rate),
+         ..SettingsChange::default()
+      });
       Ok(snapshot)
    }
 
@@ -721,7 +783,10 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      self.emit_state_changed(&snapshot);
+      self.emit_settings(SettingsChange {
+         loop_mode: Some(snapshot.loop_mode),
+         ..SettingsChange::default()
+      });
       snapshot
    }
 
@@ -749,7 +814,7 @@ impl RodioAudioPlayer {
       };
 
       match target {
-         NavTarget::Index(idx) => self.advance_to(idx),
+         NavTarget::Index(idx) => self.advance_to(idx, None),
          NavTarget::RestartCurrent => self.seek(0.0),
          NavTarget::End => self.transition_to_ended(),
       }
@@ -765,24 +830,39 @@ impl RodioAudioPlayer {
       };
 
       match target {
-         NavTarget::Index(index) => self.advance_to(index),
+         NavTarget::Index(index) => self.advance_to(index, None),
          NavTarget::RestartCurrent => self.seek(0.0),
          NavTarget::End => self.transition_to_ended(),
       }
    }
 
-   /// Loads `playlist[index]` while preserving play intent — if the player was
-   /// `Playing` before the call, it resumes playing the new item once loaded.
+   /// Loads `playlist[index]` while preserving the prior status — if the player
+   /// was `Playing` before the call, it resumes playing the new item once loaded;
+   /// if it was `Paused`, the new item is loaded and held at `Paused`.
    ///
-   /// Always emits a `Loading` state-changed event before fetching, even when
-   /// the source bytes are already cached. The cache makes the Loading window
-   /// effectively instantaneous, but the event is preserved so consumers see
-   /// identical state-machine emissions on desktop and on native mobile
-   /// platforms (iOS AVPlayer / Android ExoPlayer always emit Loading).
-   fn advance_to(&self, index: usize) -> Result<AudioActionResponse> {
-      let (was_playing, item_src, load_generation) = {
+   /// `expected_status` is the status the caller expects to find on entry. Auto-
+   /// advance from the playback monitor passes `Some(Playing)` so that a user
+   /// `pause()` / `stop()` between end-of-track detection and re-acquiring the
+   /// lock causes the auto-advance to abort cleanly. User-initiated callers
+   /// pass `None`.
+   ///
+   /// Always emits a `Loading` state-changed event before fetching. This keeps
+   /// state-machine emissions identical to native mobile platforms (iOS
+   /// AVPlayer / Android ExoPlayer always emit Loading).
+   fn advance_to(
+      &self,
+      index: usize,
+      expected_status: Option<PlaybackStatus>,
+   ) -> Result<AudioActionResponse> {
+      let (was_playing, was_paused, item_src, load_generation) = {
          let mut inner = lock_inner(&self.inner);
+
+         if let Some(expected) = expected_status {
+            transitions::assert_status(&inner.state, expected)?;
+         }
+
          let was_playing = inner.state.status == PlaybackStatus::Playing;
+         let was_paused = inner.state.status == PlaybackStatus::Paused;
 
          transitions::begin_load_index(&mut inner.state, index)?;
          inner.load_generation = inner.load_generation.wrapping_add(1);
@@ -802,13 +882,14 @@ impl RodioAudioPlayer {
 
          let snapshot = inner.state.clone();
          drop(inner);
-         self.emit_state_changed(&snapshot);
-         (was_playing, src, load_generation)
+         self.emit_state(&snapshot);
+         (was_playing, was_paused, src, load_generation)
       };
 
       let ready_snapshot = match self.load_inner(&item_src, load_generation) {
          Ok(snapshot) => {
-            self.emit_state_changed(&snapshot);
+            self.emit_state(&snapshot);
+            self.emit_track(&snapshot);
             snapshot
          }
          Err(error) => {
@@ -817,7 +898,7 @@ impl RodioAudioPlayer {
                finish_load_as_error(&mut inner, load_generation, error.to_string())
             };
             if let Some(snapshot) = snapshot {
-               self.emit_state_changed(&snapshot);
+               self.emit_state(&snapshot);
             }
             return Err(error);
          }
@@ -825,6 +906,17 @@ impl RodioAudioPlayer {
 
       if was_playing {
          self.play()
+      } else if was_paused {
+         // Preserve pause intent across the inter-track move. The sink is
+         // already paused after `load_inner`, so we only need to flip the
+         // status field.
+         let snapshot = {
+            let mut inner = lock_inner(&self.inner);
+            transitions::pause_after_load(&mut inner.state)?;
+            inner.state.clone()
+         };
+         self.emit_state(&snapshot);
+         Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Paused))
       } else {
          Ok(AudioActionResponse::new(
             ready_snapshot,
@@ -849,7 +941,11 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      self.emit_state_changed(&snapshot);
+      // `transitions::ended` jumps `current_time` to `duration`; surface that
+      // through the time-update channel so the consumer's progress bar
+      // reaches the end (the monitor is stopped at this point and won't tick).
+      self.emit_state(&snapshot);
+      self.emit_time(snapshot.current_time, snapshot.duration);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ended))
    }
 }
@@ -957,7 +1053,8 @@ fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
                ) {
                   let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
                   drop(guard);
-                  player.emit_state_changed(&snapshot);
+                  player.emit_state(&snapshot);
+                  player.emit_time(snapshot.current_time, snapshot.duration);
                   break;
                }
 
@@ -979,24 +1076,25 @@ fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
 
                      guard.state.current_time = 0.0;
                      drop(guard);
-                     (player.on_time_update)(&TimeUpdate {
-                        current_time: 0.0,
-                        duration,
-                     });
+                     player.emit_time(0.0, duration);
                   }
                   Err(e) => {
                      warn!("Failed to reopen loop source: {e}");
                      let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
                      drop(guard);
-                     player.emit_state_changed(&snapshot);
+                     player.emit_state(&snapshot);
+                     player.emit_time(snapshot.current_time, snapshot.duration);
                      break;
                   }
                }
             }
             NavTarget::Index(idx) => {
+               // Drop the lock before invoking `advance_to` (which re-acquires).
+               // Pass `Some(Playing)` so a user pause/stop in the gap between
+               // here and `advance_to`'s lock acquisition aborts the auto-advance.
                drop(guard);
-               if let Err(e) = player.advance_to(idx) {
-                  warn!("Auto-advance failed: {e}");
+               if let Err(e) = player.advance_to(idx, Some(PlaybackStatus::Playing)) {
+                  warn!("Auto-advance ended: {e}");
                }
                // `advance_to` (via `play`) starts a fresh monitor; this one exits.
                break;
@@ -1004,17 +1102,18 @@ fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
             NavTarget::End => {
                let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
                drop(guard);
-               player.emit_state_changed(&snapshot);
+               // Surface the `current_time = duration` jump made by
+               // `transitions::ended` so the UI's progress bar reaches
+               // the end. The monitor exits next, so no further ticks.
+               player.emit_state(&snapshot);
+               player.emit_time(snapshot.current_time, snapshot.duration);
                break;
             }
          }
       } else {
          guard.state.current_time = pos;
          drop(guard);
-         (player.on_time_update)(&TimeUpdate {
-            current_time: pos,
-            duration,
-         });
+         player.emit_time(pos, duration);
       }
    }
 }
