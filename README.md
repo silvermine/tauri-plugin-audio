@@ -5,10 +5,11 @@
 Headless, state-driven audio playback API for Tauri 2.x apps with native
 transport control integration.
 
-This plugin provides a cross-platform audio playback interface with transport
-controls (play, pause, stop, seek), volume/rate settings, and OS media
-integration (lock screen, notification shade, headphone controls). It is
-designed to be wrapped by a consuming app's own API layer.
+This plugin provides a cross-platform audio playback interface with playlist
+support, transport controls (play, pause, stop, seek, next, prev),
+volume/rate settings, and OS media integration (lock screen, notification
+shade, headphone controls). It is designed to be wrapped by a consuming
+app's own API layer.
 
 [ci-badge]: https://github.com/silvermine/tauri-plugin-audio/actions/workflows/ci.yml/badge.svg
 [ci-url]: https://github.com/silvermine/tauri-plugin-audio/actions/workflows/ci.yml
@@ -16,9 +17,11 @@ designed to be wrapped by a consuming app's own API layer.
 ## Features
 
    * State-machine-driven playback with type-safe action gating
+   * Playlist playback with `next` / `prev` navigation and auto-advance
+   * Loop modes: `off`, `one` (repeat current item), `all` (wrap playlist)
    * OS transport control integration via metadata (title, artist, artwork)
    * Real-time state change events (status, time, volume, etc.)
-   * Volume, mute, playback rate, and loop controls
+   * Volume, mute, and playback rate controls
    * Cross-platform support
 
 | Platform | Supported |
@@ -148,10 +151,13 @@ async function checkPlayer() {
 }
 ```
 
-#### Load, play, pause, stop, or seek
+#### Load a playlist, play, pause, stop, or seek
 
 The API uses discriminated unions with type guards for compile-time safety.
 Only valid transport actions are available based on the player's status.
+
+`load` accepts a playlist (one or more items) and an optional zero-based
+`startIndex`. Single-track callers pass a one-item array.
 
 ```ts
 import {
@@ -162,14 +168,24 @@ async function loadAndPlay() {
    const player = await getPlayer();
 
    if (player.status === PlaybackStatus.Idle) {
-      const { player: ready } = await player.load(
-         'https://example.com/song.mp3',
+      const { player: ready } = await player.load([
          {
-            title: 'My Song',
-            artist: 'Artist Name',
-            artwork: 'https://example.com/cover.jpg',
+            src: 'https://example.com/song-1.mp3',
+            metadata: {
+               title: 'Song 1',
+               artist: 'Artist',
+               artwork: 'https://example.com/cover-1.jpg',
+            },
          },
-      );
+         {
+            src: 'https://example.com/song-2.mp3',
+            metadata: {
+               title: 'Song 2',
+               artist: 'Artist',
+               artwork: 'https://example.com/cover-2.jpg',
+            },
+         },
+      ]);
 
       await ready.play();
    }
@@ -186,13 +202,39 @@ async function managePlayback() {
 }
 ```
 
+#### Navigate between playlist items
+
+`next` advances to the next item (with wrap-around when `loopMode` is
+`all`). `prev` either restarts the current item (if `currentTime > 3s`) or
+moves to the previous item, mirroring the iOS lock-screen convention.
+
+```ts
+import { getPlayer, hasAction, AudioAction } from '@silvermine/tauri-plugin-audio';
+
+async function skipForward() {
+   const player = await getPlayer();
+
+   if (hasAction(player, AudioAction.Next)) {
+      await player.next();
+   }
+}
+
+async function skipBack() {
+   const player = await getPlayer();
+
+   if (hasAction(player, AudioAction.Prev)) {
+      await player.prev();
+   }
+}
+```
+
 #### Adjust settings
 
-Volume, mute, playback rate, and loop controls are always available
+Volume, mute, playback rate, and loop-mode controls are always available
 regardless of playback status.
 
 ```ts
-import { getPlayer } from '@silvermine/tauri-plugin-audio';
+import { getPlayer, LoopMode } from '@silvermine/tauri-plugin-audio';
 
 async function adjustSettings() {
    const player = await getPlayer();
@@ -200,14 +242,15 @@ async function adjustSettings() {
    await player.setVolume(0.5);
    await player.setMuted(false);
    await player.setPlaybackRate(1.5);
-   await player.setLoop(true);
+   await player.setLoopMode(LoopMode.All);
 }
 ```
 
-#### Listen for state changes
+#### Listen for state-machine transitions
 
-`listen` receives updates for state transitions (status changes,
-volume, settings, errors).
+`onStateChanged` fires when the player's `status` or `error` field
+changes. The payload carries only those two fields — playlist /
+settings / time updates have their own channels.
 
 ```ts
 import { getPlayer, PlaybackStatus } from '@silvermine/tauri-plugin-audio';
@@ -215,11 +258,60 @@ import { getPlayer, PlaybackStatus } from '@silvermine/tauri-plugin-audio';
 async function watchPlayback() {
    const player = await getPlayer();
 
-   const unlisten = await player.listen((updated) => {
-      console.debug(`Status: ${updated.status}`);
+   const unlisten = await player.onStateChanged((change) => {
+      console.debug(`Status: ${change.status}`);
 
-      if (updated.status === PlaybackStatus.Ended) {
+      if (change.status === PlaybackStatus.Ended) {
          console.debug('Playback finished');
+      }
+   });
+
+   // To stop listening:
+   unlisten();
+}
+```
+
+#### Listen for active-track changes
+
+`onTrackChanged` fires after each item finishes loading (initial load,
+navigation, or auto-advance) and carries the active `PlaylistItem`
+with its merged ID3 metadata (title / artist / artwork).
+
+```ts
+import { getPlayer } from '@silvermine/tauri-plugin-audio';
+
+async function watchTrack() {
+   const player = await getPlayer();
+
+   const unlisten = await player.onTrackChanged((change) => {
+      console.debug(
+         `Now playing index ${change.currentIndex}: `
+         + `${change.item.metadata?.title ?? change.item.src}`,
+      );
+   });
+
+   // To stop listening:
+   unlisten();
+}
+```
+
+#### Listen for settings changes
+
+`onSettingsChanged` fires when `volume` / `muted` / `playbackRate` /
+`loopMode` is mutated. Only the changed field is set on the payload.
+
+```ts
+import { getPlayer } from '@silvermine/tauri-plugin-audio';
+
+async function watchSettings() {
+   const player = await getPlayer();
+
+   const unlisten = await player.onSettingsChanged((change) => {
+      if (change.volume !== undefined) {
+         console.debug(`Volume: ${change.volume}`);
+      }
+      if (change.muted !== undefined) {
+         console.debug(`Muted: ${change.muted}`);
       }
    });
 
@@ -230,9 +322,10 @@ async function watchPlayback() {
 
 #### Listen for time updates
 
-`onTimeUpdate` receives lightweight, high-frequency updates
-(~250ms) carrying only `currentTime` and `duration`, avoiding the
-overhead of serializing the full player state on every tick.
+`onTimeUpdate` receives lightweight position updates (`currentTime`,
+`duration`). Fires on the playback monitor's tick (~250 ms during
+playback) and on user-initiated `seek`, so consumers track position
+from a single channel regardless of source.
 
 ```ts
 import { getPlayer } from '@silvermine/tauri-plugin-audio';
@@ -258,19 +351,28 @@ async function trackProgress() {
 The player follows a state machine where transport actions are gated by
 the current `PlaybackStatus`:
 
-| Status    | Allowed Actions              |
-| --------- | ---------------------------- |
-| Idle      | load                         |
-| Loading   | stop                         |
-| Ready     | play, seek, stop             |
-| Playing   | pause, seek, stop            |
-| Paused    | play, seek, stop             |
-| Ended     | play, seek, load, stop       |
-| Error     | load                         |
+| Status    | Allowed Actions                              |
+| --------- | -------------------------------------------- |
+| Idle      | load                                         |
+| Loading   | stop                                         |
+| Ready     | play, seek, stop, next, prev, jumpTo         |
+| Playing   | pause, seek, stop, next, prev, jumpTo        |
+| Paused    | play, seek, stop, next, prev, jumpTo         |
+| Ended     | play, seek, load, stop, next, prev, jumpTo   |
+| Error     | load, stop, next, prev, jumpTo               |
 
-Settings (`setVolume`, `setMuted`, `setPlaybackRate`, `setLoop`),
-`listen`, and `onTimeUpdate` are always available regardless of
-status.
+Settings (`setVolume`, `setMuted`, `setPlaybackRate`, `setLoopMode`)
+and the event subscriptions (`onStateChanged`, `onTrackChanged`,
+`onSettingsChanged`, `onTimeUpdate`) are always available regardless
+of status.
+
+### Loop modes
+
+`setLoopMode(mode)` accepts:
+
+   * `LoopMode.Off` — emit `Ended` after the last playlist item.
+   * `LoopMode.One` — repeat the current item indefinitely.
+   * `LoopMode.All` — wrap from the last item back to the first.
 
 ## Development Standards
 
