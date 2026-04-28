@@ -1,4 +1,5 @@
 pub mod error;
+pub mod metadata;
 pub mod models;
 mod net;
 mod player;

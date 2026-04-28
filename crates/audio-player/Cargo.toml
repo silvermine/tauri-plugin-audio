@@ -14,3 +14,5 @@ thiserror = "2.0.17"
 tracing = { version = "0.1.41", default-features = false, features = ["std", "log"] }
 ureq = "2.12.1"
 url = "2.5.8"
+id3 = "1.16.4"
+base64 = "0.22.1"

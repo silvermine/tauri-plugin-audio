@@ -86,6 +86,19 @@ impl RodioAudioPlayer {
       inner.monitor_stop.store(true, Ordering::Relaxed);
    }
 
+   /// Emits a `state-changed` event with per-item `artwork` data stripped
+   /// from the playlist payload.
+   fn emit_state_changed(&self, snapshot: &PlayerState) {
+      let mut stripped = snapshot.clone();
+
+      for item in stripped.playlist.iter_mut() {
+         if let Some(meta) = item.metadata.as_mut() {
+            meta.artwork = None;
+         }
+      }
+      (self.on_changed)(&stripped);
+   }
+
    /// Spawns a new monitor thread for time updates and end-of-track detection.
    ///
    /// The old monitor thread may briefly overlap (up to 250ms) until it
@@ -137,7 +150,7 @@ impl RodioAudioPlayer {
             .ok_or_else(|| Error::InvalidState("Missing current item after begin_load".into()))?;
          let snapshot = inner.state.clone();
          drop(inner);
-         (self.on_changed)(&snapshot);
+         self.emit_state_changed(&snapshot);
          (src, load_generation)
       };
 
@@ -145,7 +158,7 @@ impl RodioAudioPlayer {
 
       match result {
          Ok(snapshot) => {
-            (self.on_changed)(&snapshot);
+            self.emit_state_changed(&snapshot);
             Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ready))
          }
          Err(error) => {
@@ -155,7 +168,7 @@ impl RodioAudioPlayer {
             };
 
             if let Some(snapshot) = snapshot {
-               (self.on_changed)(&snapshot);
+               self.emit_state_changed(&snapshot);
             }
 
             Err(error)
@@ -168,6 +181,15 @@ impl RodioAudioPlayer {
    /// auto-advance.
    fn load_inner(&self, src: &str, load_generation: u64) -> Result<PlayerState> {
       let descriptor = load_source_descriptor(src)?;
+
+      // Best-effort ID3 extraction. Local files only: we don't want to
+      // refetch a remote stream just for tags.
+      let extracted_metadata = match &descriptor {
+         SourceDescriptor::Local { path } => std::fs::read(path)
+            .ok()
+            .and_then(|bytes| crate::metadata::extract(&bytes)),
+         SourceDescriptor::Remote(_) => None,
+      };
 
       let mut attempted_playback_rate = lock_inner(&self.inner).state.playback_rate;
       let mut playback_rate_retry_stage = LoadPlaybackRateRetryStage::NotRetried;
@@ -212,6 +234,17 @@ impl RodioAudioPlayer {
                   "Playback rate changed too many times during load".into(),
                ));
             }
+         }
+
+         // Enrich the active playlist item's metadata with anything we found
+         // in the file (caller-supplied fields win per-field). Done before
+         // transitions::load so the Ready state-changed event already carries
+         // the merged metadata.
+         if let Some(idx) = inner.state.current_index
+            && let Some(item) = inner.state.playlist.get_mut(idx)
+         {
+            let merged = crate::metadata::merge(item.metadata.take(), extracted_metadata.clone());
+            item.metadata = Some(merged);
          }
 
          transitions::load(&mut inner.state, duration)?;
@@ -300,7 +333,7 @@ impl RodioAudioPlayer {
          )?,
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Playing))
    }
 
@@ -318,7 +351,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Paused))
    }
 
@@ -339,7 +372,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Idle))
    }
 
@@ -426,7 +459,7 @@ impl RodioAudioPlayer {
       };
 
       let expected = snapshot.status;
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       Ok(AudioActionResponse::new(snapshot, expected))
    }
 
@@ -597,7 +630,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       Ok(snapshot)
    }
 
@@ -611,7 +644,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       snapshot
    }
 
@@ -677,7 +710,7 @@ impl RodioAudioPlayer {
          )?,
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       Ok(snapshot)
    }
 
@@ -688,7 +721,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       snapshot
    }
 
@@ -769,13 +802,13 @@ impl RodioAudioPlayer {
 
          let snapshot = inner.state.clone();
          drop(inner);
-         (self.on_changed)(&snapshot);
+         self.emit_state_changed(&snapshot);
          (was_playing, src, load_generation)
       };
 
       let ready_snapshot = match self.load_inner(&item_src, load_generation) {
          Ok(snapshot) => {
-            (self.on_changed)(&snapshot);
+            self.emit_state_changed(&snapshot);
             snapshot
          }
          Err(error) => {
@@ -784,7 +817,7 @@ impl RodioAudioPlayer {
                finish_load_as_error(&mut inner, load_generation, error.to_string())
             };
             if let Some(snapshot) = snapshot {
-               (self.on_changed)(&snapshot);
+               self.emit_state_changed(&snapshot);
             }
             return Err(error);
          }
@@ -816,7 +849,7 @@ impl RodioAudioPlayer {
          inner.state.clone()
       };
 
-      (self.on_changed)(&snapshot);
+      self.emit_state_changed(&snapshot);
       Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ended))
    }
 }
@@ -924,7 +957,7 @@ fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
                ) {
                   let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
                   drop(guard);
-                  (player.on_changed)(&snapshot);
+                  player.emit_state_changed(&snapshot);
                   break;
                }
 
@@ -955,7 +988,7 @@ fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
                      warn!("Failed to reopen loop source: {e}");
                      let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
                      drop(guard);
-                     (player.on_changed)(&snapshot);
+                     player.emit_state_changed(&snapshot);
                      break;
                   }
                }
@@ -971,7 +1004,7 @@ fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
             NavTarget::End => {
                let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
                drop(guard);
-               (player.on_changed)(&snapshot);
+               player.emit_state_changed(&snapshot);
                break;
             }
          }
