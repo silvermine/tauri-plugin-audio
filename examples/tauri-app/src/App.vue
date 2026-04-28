@@ -2,25 +2,28 @@
    <div class="app">
       <h1>Audio Player Demo</h1>
 
-      <!-- Load bar -->
-      <div class="load-bar">
-         <input
-            v-model="sourceUrl"
-            type="text"
-            placeholder="File path or URL"
-            @keydown.enter="loadTrack"
+      <!-- Playlist editor -->
+      <div class="playlist-editor">
+         <label class="playlist-label">Playlist (one URL per line)</label>
+         <textarea
+            v-model="playlistText"
+            class="playlist-input"
+            rows="4"
+            placeholder="https://example.com/song.mp3"
          />
-         <button class="load-btn" @click="loadTrack" :disabled="!canLoad || isLoading">
-            Load
-         </button>
+         <div class="playlist-actions">
+            <button class="load-btn" @click="loadPlaylist" :disabled="!canLoad || isLoading">
+               Load playlist
+            </button>
+         </div>
       </div>
 
       <div class="player">
          <!-- Artwork (left) -->
          <div class="player-artwork">
             <img
-               v-if="player?.artwork"
-               :src="player.artwork"
+               v-if="currentArtwork"
+               :src="currentArtwork"
                class="artwork"
                alt="Album artwork"
             />
@@ -53,6 +56,13 @@
 
             <!-- Controls row -->
             <div class="controls-row">
+               <!-- Prev -->
+               <button class="ctrl-btn" @click="prev" :disabled="!canPrev">
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                     <path d="M6 6h2v12H6zM9.5 12l8.5 6V6z"/>
+                  </svg>
+               </button>
+
                <!-- Play / Pause -->
                <button class="ctrl-btn large" @click="togglePlay" :disabled="!canPlay && !canPause">
                   <svg v-if="isPlaying" viewBox="0 0 24 24" fill="currentColor">
@@ -61,6 +71,13 @@
                   </svg>
                   <svg v-else viewBox="0 0 24 24" fill="currentColor">
                      <path d="M8 5v14l11-7z"/>
+                  </svg>
+               </button>
+
+               <!-- Next -->
+               <button class="ctrl-btn" @click="next" :disabled="!canNext">
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                     <path d="M6 18l8.5-6L6 6zM16 6h2v12h-2z"/>
                   </svg>
                </button>
 
@@ -103,6 +120,17 @@
                   <span class="volume-tooltip">{{ volumePercent }}</span>
                </div>
 
+               <!-- Loop mode cycler -->
+               <button class="ctrl-btn loop-btn" :class="{ active: currentLoopMode !== LoopMode.Off }" @click="cycleLoopMode" :title="`Loop: ${currentLoopMode}`">
+                  <svg v-if="currentLoopMode === LoopMode.One" viewBox="0 0 24 24" fill="currentColor">
+                     <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>
+                     <text x="12" y="14" text-anchor="middle" font-size="8" font-weight="bold" fill="currentColor">1</text>
+                  </svg>
+                  <svg v-else viewBox="0 0 24 24" fill="currentColor">
+                     <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>
+                  </svg>
+               </button>
+
                <!-- Settings toggle -->
                <div class="settings-anchor" ref="settingsAnchorEl">
                   <button class="ctrl-btn large" @click="toggleSettingsMenu">
@@ -113,34 +141,26 @@
 
                   <!-- Settings popover menu -->
                   <div v-if="showSettings" class="settings-menu" @click.stop>
-                     <!-- Main menu -->
                      <template v-if="settingsView === 'main'">
                         <button class="menu-item" @click="settingsView = 'speed'">
-                           <svg class="menu-icon" viewBox="0 0 24 24" fill="currentColor">
-                              <path d="M10 8v8l6-4-6-4zm1.5 2.83L13.54 12l-2.04 1.17V10.83zM20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12z"/>
-                           </svg>
+                           <span class="menu-icon"></span>
                            <span class="menu-label">Speed</span>
                            <span class="menu-value">{{ speedLabel }}</span>
                            <svg class="menu-chevron" viewBox="0 0 24 24" fill="currentColor">
                               <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/>
                            </svg>
                         </button>
-                        <button class="menu-item" @click="toggleLoop">
-                           <svg class="menu-icon" viewBox="0 0 24 24" fill="currentColor">
-                              <path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>
-                           </svg>
+                        <button class="menu-item" @click="cycleLoopMode">
+                           <span class="menu-icon"></span>
                            <span class="menu-label">Loop</span>
-                           <span class="menu-value">{{ player?.loop ? 'On' : 'Off' }}</span>
+                           <span class="menu-value">{{ currentLoopMode }}</span>
                         </button>
-                        <button v-if="canStop" class="menu-item destructive" @click="stopTrack">
-                           <svg class="menu-icon" viewBox="0 0 24 24" fill="currentColor">
-                              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
-                           </svg>
+                        <button v-if="canStop" class="menu-item destructive" @click="stopPlayback">
+                           <span class="menu-icon"></span>
                            <span class="menu-label">Unload</span>
                         </button>
                      </template>
 
-                     <!-- Speed submenu -->
                      <template v-if="settingsView === 'speed'">
                         <button class="menu-item menu-back" @click="settingsView = 'main'">
                            <svg class="menu-icon" viewBox="0 0 24 24" fill="currentColor">
@@ -170,6 +190,22 @@
 
          <!-- Error display -->
          <div v-if="errorMessage" class="error">{{ errorMessage }}</div>
+      </div>
+
+      <!-- Playlist preview -->
+      <div v-if="player?.playlist?.length" class="playlist-preview">
+         <button
+            v-for="(item, idx) in player.playlist"
+            :key="`${idx}-${item.src}`"
+            type="button"
+            class="playlist-item"
+            :class="{ active: idx === player.currentIndex }"
+            :disabled="!canJumpTo"
+            @click="jumpTo(idx)"
+         >
+            <span class="playlist-index">{{ idx + 1 }}</span>
+            <span class="playlist-title">{{ item.metadata?.title || item.src.split('/').pop() }}</span>
+         </button>
       </div>
 
       <!-- Event log -->
@@ -207,22 +243,24 @@ import './style.css';
 import {
    getPlayer,
    PlaybackStatus,
+   LoopMode,
    hasAction,
    AudioAction,
 } from '@silvermine/tauri-plugin-audio';
-import type { PlayerWithAnyStatus, AudioMetadata } from '@silvermine/tauri-plugin-audio';
+import type { PlayerWithAnyStatus, PlaylistItem } from '@silvermine/tauri-plugin-audio';
+
+const KALIMBA_SRC = 'https://www.learningcontainer.com/wp-content/uploads/2020/02/Kalimba.mp3';
+
+/// Default text shown in the playlist textarea on first load.
+/// Auto-parsed and loaded once the player is ready in `onMounted`.
+const DEFAULT_PLAYLIST_TEXT = [ KALIMBA_SRC, KALIMBA_SRC, KALIMBA_SRC ].join('\n');
 
 const player = ref<PlayerWithAnyStatus | null>(null);
 const currentTime = ref(0);
 const seekPreviewTime = ref<number | null>(null);
 const duration = ref(0);
-const SAMPLE_TRACK = {
-   src: 'https://www.learningcontainer.com/wp-content/uploads/2020/02/Kalimba.mp3',
-   title: 'Kalimba',
-   artwork: 'https://cdn.pixabay.com/photo/2024/02/28/07/42/european-shorthair-8601492_1280.jpg',
-};
 
-const sourceUrl = ref(SAMPLE_TRACK.src);
+const playlistText = ref(DEFAULT_PLAYLIST_TEXT);
 const showSettings = ref(false);
 const settingsView = ref<'main' | 'speed'>('main');
 const settingsAnchorEl = ref<HTMLElement | null>(null);
@@ -260,11 +298,16 @@ const eventLogEl = ref<HTMLElement | null>(null);
 let lastStateSnapshot: Record<string, unknown> | null = null;
 
 const filteredEvents = computed(() => {
-   if (showTimeUpdates.value) {
-      return eventLog.value;
-   }
-   return eventLog.value.filter((e) => e.type === 'state');
+   return showTimeUpdates.value ? eventLog.value : eventLog.value.filter((e) => e.type === 'state');
 });
+
+function parsePlaylist(text: string): PlaylistItem[] {
+   return text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((src) => { return { src }; });
+}
 
 function formatTimestamp(): string {
    const now = new Date(),
@@ -295,21 +338,22 @@ function summarizeStateChange(updated: PlayerWithAnyStatus): string {
    const prev = lastStateSnapshot;
    const parts: string[] = [];
 
-   // Status transition
    if (!prev || prev.status !== curr.status) {
       parts.push(prev ? `${prev.status} → ${curr.status}` : `${curr.status}`);
    }
 
-   // Track change
-   if (!prev || prev.src !== curr.src) {
-      const name = updated.title || (updated.src ? updated.src.split('/').pop() : null);
+   if (!prev || prev.currentIndex !== curr.currentIndex) {
+      const item = updated.currentIndex !== null ? updated.playlist[updated.currentIndex] : null;
+      const name = item?.metadata?.title || item?.src.split('/').pop() || null;
 
       if (name) {
-         parts.push(name);
+         const total = updated.playlist.length;
+         const idx = (updated.currentIndex ?? 0) + 1;
+
+         parts.push(`${idx}/${total} — ${name}`);
       }
    }
 
-   // Setting changes
    if (prev) {
       if (prev.volume !== curr.volume) {
          parts.push(`volume: ${Math.round((curr.volume as number) * 100)}%`);
@@ -320,8 +364,8 @@ function summarizeStateChange(updated: PlayerWithAnyStatus): string {
       if (prev.playbackRate !== curr.playbackRate) {
          parts.push(`rate: ${curr.playbackRate}x`);
       }
-      if (prev.loop !== curr.loop) {
-         parts.push(curr.loop ? 'loop: on' : 'loop: off');
+      if (prev.loopMode !== curr.loopMode) {
+         parts.push(`loop: ${curr.loopMode}`);
       }
       if (prev.duration !== curr.duration && (curr.duration as number) > 0) {
          parts.push(`duration: ${formatTime(curr.duration as number)}`);
@@ -342,11 +386,25 @@ function summarizeStateChange(updated: PlayerWithAnyStatus): string {
 
 // -- Computed --
 
+const currentItem = computed(() => {
+   if (!player.value || player.value.currentIndex === null) {
+      return null;
+   }
+   return player.value.playlist[player.value.currentIndex] ?? null;
+});
+
+const currentArtwork = computed(() => currentItem.value?.metadata?.artwork || null);
+
 const trackTitle = computed(() => {
    if (!player.value || player.value.status === PlaybackStatus.Idle) {
       return 'No track loaded';
    }
-   return player.value.title || player.value.src?.split('/').pop() || 'Unknown';
+   const item = currentItem.value;
+   const title = item?.metadata?.title || item?.src.split('/').pop() || 'Unknown';
+   const total = player.value.playlist.length;
+   const idx = (player.value.currentIndex ?? 0) + 1;
+
+   return total > 1 ? `${idx}/${total} — ${title}` : title;
 });
 
 const progressValue = computed(() => {
@@ -362,28 +420,18 @@ const isPlaying = computed(() => player.value?.status === PlaybackStatus.Playing
 const canLoad = computed(() => {
    return player.value
       && (hasAction(player.value, AudioAction.Load) || hasAction(player.value, AudioAction.Stop))
-      && sourceUrl.value.length > 0;
+      && playlistText.value.trim().length > 0;
 });
 
-const canPlay = computed(() => {
-   return player.value && hasAction(player.value, AudioAction.Play);
-});
+const canPlay = computed(() => Boolean(player.value && hasAction(player.value, AudioAction.Play)));
+const canPause = computed(() => Boolean(player.value && hasAction(player.value, AudioAction.Pause)));
+const canSeek = computed(() => Boolean(player.value && hasAction(player.value, AudioAction.Seek)));
+const canStop = computed(() => Boolean(player.value && hasAction(player.value, AudioAction.Stop)));
+const canNext = computed(() => Boolean(player.value && hasAction(player.value, AudioAction.Next)));
+const canPrev = computed(() => Boolean(player.value && hasAction(player.value, AudioAction.Prev)));
+const canJumpTo = computed(() => Boolean(player.value && hasAction(player.value, AudioAction.JumpTo)));
 
-const canPause = computed(() => {
-   return player.value && hasAction(player.value, AudioAction.Pause);
-});
-
-const canSeek = computed(() => {
-   return player.value && hasAction(player.value, AudioAction.Seek);
-});
-
-const canStop = computed(() => {
-   return player.value && hasAction(player.value, AudioAction.Stop);
-});
-
-const volumePercent = computed(() => {
-   return `${Math.round((player.value?.volume ?? 1) * 100)}`;
-});
+const volumePercent = computed(() => `${Math.round((player.value?.volume ?? 1) * 100)}`);
 
 const speedLabel = computed(() => {
    const rate = player.value?.playbackRate ?? 1;
@@ -391,6 +439,8 @@ const speedLabel = computed(() => {
 
    return opt ? opt.label : `${rate}x`;
 });
+
+const currentLoopMode = computed(() => player.value?.loopMode ?? LoopMode.Off);
 
 // -- Helpers --
 
@@ -431,8 +481,14 @@ async function selectSpeed(rate: number): Promise<void> {
 
 // -- Actions --
 
-async function loadTrack(): Promise<void> {
-   if (!player.value || !sourceUrl.value) {
+async function loadPlaylist(): Promise<void> {
+   if (!player.value) {
+      return;
+   }
+   const items = parsePlaylist(playlistText.value);
+
+   if (items.length === 0) {
+      errorMessage.value = 'Playlist is empty';
       return;
    }
 
@@ -440,7 +496,6 @@ async function loadTrack(): Promise<void> {
    errorMessage.value = '';
 
    try {
-      // Stop current track first if needed
       if (hasAction(player.value, AudioAction.Stop)) {
          const stopResp = await player.value.stop();
 
@@ -451,12 +506,7 @@ async function loadTrack(): Promise<void> {
          return;
       }
 
-      const isSample = sourceUrl.value === SAMPLE_TRACK.src;
-      const metadata: AudioMetadata = {
-         title: isSample ? SAMPLE_TRACK.title : sourceUrl.value.split('/').pop() || 'Unknown Track',
-         ...(isSample && { artwork: SAMPLE_TRACK.artwork }),
-      };
-      const resp = await player.value.load(sourceUrl.value, metadata);
+      const resp = await player.value.load(items);
 
       player.value = resp.player;
       duration.value = resp.player.duration;
@@ -472,9 +522,7 @@ async function togglePlay(): Promise<void> {
    if (!player.value) {
       return;
    }
-
    errorMessage.value = '';
-
    try {
       if (hasAction(player.value, AudioAction.Play)) {
          const resp = await player.value.play();
@@ -485,6 +533,45 @@ async function togglePlay(): Promise<void> {
 
          player.value = resp.player;
       }
+   } catch (e) {
+      errorMessage.value = `${e}`;
+   }
+}
+
+async function next(): Promise<void> {
+   if (!player.value || !hasAction(player.value, AudioAction.Next)) {
+      return;
+   }
+   try {
+      const resp = await player.value.next();
+
+      player.value = resp.player;
+   } catch (e) {
+      errorMessage.value = `${e}`;
+   }
+}
+
+async function prev(): Promise<void> {
+   if (!player.value || !hasAction(player.value, AudioAction.Prev)) {
+      return;
+   }
+   try {
+      const resp = await player.value.prev();
+
+      player.value = resp.player;
+   } catch (e) {
+      errorMessage.value = `${e}`;
+   }
+}
+
+async function jumpTo(index: number): Promise<void> {
+   if (!player.value || !hasAction(player.value, AudioAction.JumpTo)) {
+      return;
+   }
+   try {
+      const resp = await player.value.jumpTo(index);
+
+      player.value = resp.player;
    } catch (e) {
       errorMessage.value = `${e}`;
    }
@@ -542,18 +629,23 @@ async function setPlaybackRate(rate: number): Promise<void> {
    player.value = await player.value.setPlaybackRate(rate);
 }
 
-async function toggleLoop(): Promise<void> {
+async function cycleLoopMode(): Promise<void> {
    if (!player.value) {
       return;
    }
-   player.value = await player.value.setLoop(!player.value.loop);
+   const cycle: Record<LoopMode, LoopMode> = {
+      [LoopMode.Off]: LoopMode.All,
+      [LoopMode.All]: LoopMode.One,
+      [LoopMode.One]: LoopMode.Off,
+   };
+
+   player.value = await player.value.setLoopMode(cycle[player.value.loopMode]);
 }
 
-async function stopTrack(): Promise<void> {
+async function stopPlayback(): Promise<void> {
    if (!player.value || !hasAction(player.value, AudioAction.Stop)) {
       return;
    }
-
    const resp = await player.value.stop();
 
    player.value = resp.player;
@@ -604,14 +696,14 @@ onMounted(async () => {
       });
    });
 
-   // Preload sample track
-   if (hasAction(p, AudioAction.Load)) {
+   // Auto-load whatever is in the textarea on first mount so the demo is
+   // ready to play without an extra click. The textarea remains editable.
+   const initialItems = parsePlaylist(playlistText.value);
+
+   if (initialItems.length > 0 && hasAction(p, AudioAction.Load)) {
       try {
          isLoading.value = true;
-         const resp = await p.load(SAMPLE_TRACK.src, {
-            title: SAMPLE_TRACK.title,
-            artwork: SAMPLE_TRACK.artwork,
-         });
+         const resp = await p.load(initialItems);
 
          player.value = resp.player;
          duration.value = resp.player.duration;
@@ -667,15 +759,33 @@ h1 {
    justify-content: center;
 }
 
-/* Load bar */
-.load-bar {
+/* Playlist editor */
+.playlist-editor {
    display: flex;
-   gap: 8px;
+   flex-direction: column;
+   gap: 6px;
    margin-bottom: 12px;
 }
 
-.load-bar input[type="text"] {
-   flex: 1;
+.playlist-label {
+   font-size: 12px;
+   color: #98989d;
+}
+
+.playlist-input {
+   font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+   font-size: 12px;
+   background: #1c1c1e;
+   color: #f5f5f7;
+   border: 1px solid #48484a;
+   border-radius: 6px;
+   padding: 8px;
+   resize: vertical;
+}
+
+.playlist-actions {
+   display: flex;
+   justify-content: flex-end;
 }
 
 .load-btn {
@@ -699,6 +809,70 @@ h1 {
    cursor: not-allowed;
 }
 
+/* Playlist preview */
+.playlist-preview {
+   margin-top: 12px;
+   background: #1c1c1e;
+   border-radius: 8px;
+   overflow: hidden;
+}
+
+.playlist-item {
+   display: flex;
+   align-items: center;
+   gap: 10px;
+   width: 100%;
+   padding: 8px 12px;
+   font-size: 13px;
+   color: #d1d1d6;
+   text-align: left;
+   background: transparent;
+   border: none;
+   border-bottom: 1px solid #2c2c2e;
+   cursor: pointer;
+}
+
+.playlist-item:last-child {
+   border-bottom: none;
+}
+
+.playlist-item:hover:not(:disabled) {
+   background: rgba(255, 255, 255, 0.04);
+}
+
+.playlist-item:disabled {
+   cursor: not-allowed;
+   opacity: 0.5;
+}
+
+.playlist-item.active {
+   background: rgba(10, 132, 255, 0.15);
+   color: #f5f5f7;
+}
+
+.playlist-item.active:hover:not(:disabled) {
+   background: rgba(10, 132, 255, 0.22);
+}
+
+.playlist-index {
+   color: #636366;
+   font-variant-numeric: tabular-nums;
+   width: 24px;
+   text-align: right;
+}
+
+.playlist-item.active .playlist-index {
+   color: #0a84ff;
+   font-weight: 600;
+}
+
+.playlist-title {
+   flex: 1;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   white-space: nowrap;
+}
+
 /* Progress bar */
 .progress-bar {
    width: 100%;
@@ -714,7 +888,6 @@ h1 {
    visibility: hidden;
 }
 
-/* Track info */
 .track-row {
    display: flex;
    align-items: center;
@@ -757,7 +930,6 @@ h1 {
    white-space: nowrap;
 }
 
-/* Controls */
 .controls-row {
    display: flex;
    align-items: center;
@@ -777,6 +949,11 @@ h1 {
 
 .ctrl-btn:hover:not(:disabled) {
    background: rgba(255, 255, 255, 0.08);
+}
+
+.ctrl-btn:disabled {
+   opacity: 0.3;
+   cursor: not-allowed;
 }
 
 .ctrl-btn svg {
@@ -815,6 +992,10 @@ h1 {
    transform: translate(-50%, -30%);
 }
 
+.ctrl-btn.loop-btn.active {
+   color: #0a84ff;
+}
+
 .volume-control {
    position: relative;
    display: flex;
@@ -847,7 +1028,6 @@ h1 {
    opacity: 1;
 }
 
-/* Settings menu */
 .settings-anchor {
    position: relative;
    margin-left: auto;
@@ -858,7 +1038,7 @@ h1 {
    bottom: calc(100% + 8px);
    right: 0;
    min-width: 200px;
-   max-height: 180px;
+   max-height: 220px;
    overflow-y: auto;
    background: #2c2c2e;
    border: 1px solid #48484a;
@@ -916,6 +1096,7 @@ h1 {
 .menu-value {
    font-size: 12px;
    color: #98989d;
+   text-transform: capitalize;
 }
 
 .menu-chevron {
@@ -931,7 +1112,6 @@ h1 {
    margin: 4px 0;
 }
 
-/* Error */
 .error {
    font-size: 12px;
    color: #ff453a;
@@ -940,7 +1120,6 @@ h1 {
    border-radius: 6px;
 }
 
-/* Event log */
 .event-log {
    margin-top: 16px;
    background: #1c1c1e;
