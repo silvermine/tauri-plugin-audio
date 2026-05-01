@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::f32::consts::PI;
 use std::fs::File;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::PathBuf;
@@ -13,6 +14,9 @@ use signalsmith::PlaybackStream;
 const SOURCE_DURATION_SECONDS: usize = 5;
 const OUTPUT_BLOCK_FRAMES: usize = 512;
 const FLUSH_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 4;
+const SEEK_FADE_FRAMES: usize = OUTPUT_BLOCK_FRAMES;
+const PLAYER_SEEK_FADE_STEPS: usize = 10;
+const PLAYER_SEEK_FADE_MS: u64 = 50;
 
 type BoxedSource = Box<dyn Source<Item = f32> + Send>;
 type FixtureDecoder = (BoxedSource, NonZeroU16, NonZeroU32, Option<Duration>);
@@ -56,6 +60,23 @@ fn assert_fixture_length(
    }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeekTransition {
+   Idle,
+   FadingOut {
+      target_frame: usize,
+      remaining_frames: usize,
+      total_frames: usize,
+   },
+   Pending {
+      target_frame: usize,
+   },
+   FadingIn {
+      remaining_frames: usize,
+      total_frames: usize,
+   },
+}
+
 struct StreamingPlaybackSource {
    input: BoxedSource,
    stream: PlaybackStream,
@@ -68,6 +89,9 @@ struct StreamingPlaybackSource {
    current_segment_end_frame: usize,
    flushed: bool,
    ended: bool,
+   frame_position: usize,
+   current_envelope: f32,
+   seek_transition: SeekTransition,
 }
 
 impl StreamingPlaybackSource {
@@ -96,6 +120,9 @@ impl StreamingPlaybackSource {
          current_segment_end_frame,
          flushed: false,
          ended: false,
+         frame_position: 0,
+         current_envelope: 1.0,
+         seek_transition: SeekTransition::Idle,
       }
    }
 
@@ -106,6 +133,14 @@ impl StreamingPlaybackSource {
    fn clear_output_buffer(&mut self) {
       self.output_buffer.clear();
       self.output_index = 0;
+   }
+
+   fn remaining_output_frames(&self) -> usize {
+      self
+         .output_buffer
+         .len()
+         .saturating_sub(self.output_index)
+         / self.channel_count()
    }
 
    fn read_exact_input_frames(&mut self, input_frames: usize, context: &str) {
@@ -139,6 +174,94 @@ impl StreamingPlaybackSource {
       self.read_exact_input_frames(seek_input_frames, "seek warmup");
       self.stream.output_seek_interleaved(&self.input_buffer);
       self.input_buffer.clear();
+
+      Ok(())
+   }
+
+   fn schedule_seek_to_frame(&mut self, seek_frame: usize) -> Result<(), RodioSeekError> {
+      self.ended = false;
+
+      if self.output_index >= self.output_buffer.len() && !self.refill_output_buffer() {
+         return self.apply_or_defer_seek_without_fade(seek_frame);
+      }
+
+      let fade_frames = self.remaining_output_frames().min(SEEK_FADE_FRAMES);
+      if fade_frames < 2 {
+         return self.apply_or_defer_seek_without_fade(seek_frame);
+      }
+
+      self.seek_transition = SeekTransition::FadingOut {
+         target_frame: seek_frame,
+         remaining_frames: fade_frames,
+         total_frames: fade_frames,
+      };
+
+      Ok(())
+   }
+
+   fn apply_or_defer_seek_without_fade(&mut self, seek_frame: usize) -> Result<(), RodioSeekError> {
+      if self.frame_position == 0 {
+         self.seek_to_frame(seek_frame)?;
+         self.start_seek_fade_in();
+      } else {
+         self.seek_transition = SeekTransition::Pending {
+            target_frame: seek_frame,
+         };
+      }
+
+      Ok(())
+   }
+
+   fn start_seek_fade_in(&mut self) {
+      let fade_frames = SEEK_FADE_FRAMES.max(2);
+      self.seek_transition = SeekTransition::FadingIn {
+         remaining_frames: fade_frames,
+         total_frames: fade_frames,
+      };
+   }
+
+   fn begin_frame(&mut self) -> Result<(), RodioSeekError> {
+      if let SeekTransition::Pending { target_frame } = self.seek_transition {
+         self.seek_to_frame(target_frame)?;
+         self.start_seek_fade_in();
+      }
+
+      self.current_envelope = match self.seek_transition {
+         SeekTransition::FadingOut {
+            remaining_frames,
+            total_frames,
+            ..
+         } => envelope_for_step(total_frames - remaining_frames, total_frames, true),
+         SeekTransition::FadingIn {
+            remaining_frames,
+            total_frames,
+         } => envelope_for_step(total_frames - remaining_frames, total_frames, false),
+         SeekTransition::Idle | SeekTransition::Pending { .. } => 1.0,
+      };
+
+      self.seek_transition = match self.seek_transition {
+         SeekTransition::FadingOut {
+            target_frame,
+            remaining_frames,
+            total_frames,
+         } if remaining_frames > 1 => SeekTransition::FadingOut {
+            target_frame,
+            remaining_frames: remaining_frames - 1,
+            total_frames,
+         },
+         SeekTransition::FadingOut { target_frame, .. } => SeekTransition::Pending {
+            target_frame,
+         },
+         SeekTransition::FadingIn {
+            remaining_frames,
+            total_frames,
+         } if remaining_frames > 1 => SeekTransition::FadingIn {
+            remaining_frames: remaining_frames - 1,
+            total_frames,
+         },
+         SeekTransition::FadingIn { .. } => SeekTransition::Idle,
+         transition => transition,
+      };
 
       Ok(())
    }
@@ -195,6 +318,11 @@ impl Iterator for StreamingPlaybackSource {
    type Item = f32;
 
    fn next(&mut self) -> Option<Self::Item> {
+      if self.frame_position == 0 && self.begin_frame().is_err() {
+         self.ended = true;
+         return None;
+      }
+
       while self.output_index >= self.output_buffer.len() {
          if !self.refill_output_buffer() {
             self.ended = true;
@@ -207,10 +335,15 @@ impl Iterator for StreamingPlaybackSource {
          }
       }
 
-      let sample = self.output_buffer.get(self.output_index).copied();
+      let sample = self.output_buffer.get(self.output_index).copied()?;
       self.output_index += 1;
 
-      sample
+      self.frame_position += 1;
+      if self.frame_position >= self.channel_count() {
+         self.frame_position = 0;
+      }
+
+      Some(sample * self.current_envelope)
    }
 }
 
@@ -223,7 +356,7 @@ impl Source for StreamingPlaybackSource {
       let seek_frame = ((position.as_secs_f64() * self.sample_rate_hz.get() as f64).floor() as usize)
          .min(self.current_segment_end_frame);
 
-      self.seek_to_frame(seek_frame)
+      self.schedule_seek_to_frame(seek_frame)
    }
 
    fn channels(&self) -> NonZeroU16 {
@@ -253,6 +386,37 @@ fn wait_for_played_source_seconds(playback_rate: f32, source_seconds: f64) {
    thread::sleep(Duration::from_secs_f64(
       source_seconds / playback_rate as f64,
    ));
+}
+
+fn envelope_for_step(step: usize, total_steps: usize, fade_out: bool) -> f32 {
+   let denominator = total_steps.saturating_sub(1).max(1) as f32;
+   let progress = (step.min(total_steps.saturating_sub(1)) as f32) / denominator;
+   if fade_out {
+      0.5 * (1.0 + (PI * progress).cos())
+   } else {
+      0.5 * (1.0 - (PI * progress).cos())
+   }
+}
+
+fn fade_player_volume(player: &Player, fade_out: bool) {
+   let step_duration = Duration::from_millis(
+      (PLAYER_SEEK_FADE_MS / PLAYER_SEEK_FADE_STEPS.max(1) as u64).max(1),
+   );
+
+   for step in 0..PLAYER_SEEK_FADE_STEPS {
+      player.set_volume(envelope_for_step(step, PLAYER_SEEK_FADE_STEPS, fade_out));
+      thread::sleep(step_duration);
+   }
+
+   player.set_volume(if fade_out { 0.0 } else { 1.0 });
+}
+
+fn seek_player_with_fade(player: &Player, position: Duration) -> Result<(), RodioSeekError> {
+   fade_player_volume(player, true);
+   player.try_seek(position)?;
+   fade_player_volume(player, false);
+
+   Ok(())
 }
 
 fn play_fixture_at_rate(playback_rate: f32) -> Result<(), Box<dyn Error>> {
@@ -333,6 +497,58 @@ fn play_fixture_at_rate_with_seek(
 
    second_source.seek_to_frame(seek_frame)?;
    play_streaming_audio(second_source)
+}
+
+fn play_fixture_at_rate_with_faded_direct_seek(
+   playback_rate: f32,
+   first_segment_end_seconds: usize,
+   seek_seconds: usize,
+   second_segment_end_seconds: usize,
+) -> Result<(), Box<dyn Error>> {
+   let (input, channels, sample_rate_hz, total_duration) = open_fixture_decoder()?;
+   let preview_frames = preview_source_frames(sample_rate_hz.get());
+   let available_frames = available_source_frames(total_duration, sample_rate_hz.get())
+      .unwrap_or(preview_frames);
+   let first_segment_end_frames = sample_rate_hz.get() as usize * first_segment_end_seconds;
+   let second_segment_end_frame = sample_rate_hz.get() as usize * second_segment_end_seconds;
+
+   assert!(
+      channels.get() > 0,
+      "fixture WAV must have at least one channel"
+   );
+   assert!(
+      first_segment_end_frames < available_frames,
+      "direct seek must happen before the source ends"
+   );
+   assert!(
+      seek_seconds < second_segment_end_seconds,
+      "seek must land before the final segment end"
+   );
+   assert!(
+      second_segment_end_frame <= available_frames,
+      "second segment exceeds fixture length"
+   );
+
+   let sink = DeviceSinkBuilder::open_default_sink()?;
+   let player = Player::connect_new(sink.mixer());
+
+   player.append(StreamingPlaybackSource::new(
+      input,
+      channels,
+      sample_rate_hz,
+      playback_rate,
+      available_frames,
+   ));
+
+   wait_for_played_source_seconds(playback_rate, first_segment_end_seconds as f64);
+   seek_player_with_fade(&player, Duration::from_secs_f64(seek_seconds as f64))?;
+   wait_for_played_source_seconds(
+      playback_rate,
+      (second_segment_end_seconds - seek_seconds) as f64,
+   );
+   player.stop();
+
+   Ok(())
 }
 
 fn play_fixture_at_rate_with_direct_seek(
@@ -552,10 +768,10 @@ fn play_supports_significantly_faster_playback_rate() -> Result<(), Box<dyn Erro
 // Seek
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn seek_supports_direct_seek_during_playback()
+fn seek_supports_faded_direct_seek_during_playback()
 -> Result<(), Box<dyn Error>> {
-   // clicks
-   play_fixture_at_rate_with_direct_seek(1.25, 4, 2, SOURCE_DURATION_SECONDS)
+   // rare clicks
+   play_fixture_at_rate_with_faded_direct_seek(1.25, 4, 2, SOURCE_DURATION_SECONDS)
 }
 
 #[test]
@@ -564,6 +780,14 @@ fn seek_supports_reopened_source_seek()
 -> Result<(), Box<dyn Error>> {
    // no click
    play_fixture_at_rate_with_seek(1.25, 4, 2, SOURCE_DURATION_SECONDS)
+}
+
+#[test]
+#[ignore = "manual audible check; plays rendered output through rodio"]
+fn seek_supports_direct_seek_during_playback()
+-> Result<(), Box<dyn Error>> {
+   // clicks
+   play_fixture_at_rate_with_direct_seek(1.25, 4, 2, SOURCE_DURATION_SECONDS)
 }
 
 // Resume
