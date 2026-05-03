@@ -559,6 +559,12 @@ fn open_audio_output() -> Result<MixerDeviceSink> {
       .map_err(|e| Error::Audio(format!("Failed to open audio device: {e}")))
 }
 
+fn finish_playback_as_ended(inner: &mut Inner, duration: f64, position: f64) -> PlayerState {
+   inner.state.status = PlaybackStatus::Ended;
+   inner.state.current_time = if duration > 0.0 { duration } else { position };
+   inner.state.clone()
+}
+
 // ---------------------------------------------------------------------------
 // Playback monitor
 // ---------------------------------------------------------------------------
@@ -601,20 +607,25 @@ fn monitor_loop(
                      ctx.position_offset = 0.0;
                      ctx.seek_strategy = seek_strategy;
                      ctx.resume_fade = resume_fade;
+
+                     guard.state.current_time = 0.0;
+                     drop(guard);
+                     on_time_update(&TimeUpdate {
+                        current_time: 0.0,
+                        duration,
+                     });
                   }
-                  Err(e) => warn!("Failed to reopen loop source: {e}"),
+                  Err(e) => {
+                     warn!("Failed to reopen loop source: {e}");
+                     let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
+                     drop(guard);
+                     on_changed(&snapshot);
+                     break;
+                  }
                }
             }
-            guard.state.current_time = 0.0;
-            drop(guard);
-            on_time_update(&TimeUpdate {
-               current_time: 0.0,
-               duration,
-            });
          } else {
-            guard.state.status = PlaybackStatus::Ended;
-            guard.state.current_time = if duration > 0.0 { duration } else { pos };
-            let snapshot = guard.state.clone();
+            let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
             drop(guard);
             on_changed(&snapshot);
             break;
