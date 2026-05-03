@@ -122,6 +122,38 @@ fn play_fixture_at_rate_with_seek(
    Ok(())
 }
 
+fn play_fixture_at_rate_with_pause_and_resume(
+   playback_rate: f64,
+   played_seconds: usize,
+   paused_seconds: usize,
+   resume_end_seconds: usize,
+) -> Result<(), Box<dyn Error>> {
+   let fixture_path = fixture_path()?;
+   let fixture_src = fixture_path.to_string_lossy().into_owned();
+   let player = RodioAudioPlayer::new(no_op_on_changed(), no_op_on_time_update())?;
+
+   player.load(&fixture_src, None)?;
+   player.set_playback_rate(playback_rate)?;
+
+   let state = player.get_state();
+   assert!(
+      state.duration >= resume_end_seconds as f64,
+      "fixture duration must be at least {}s, got {}s",
+      resume_end_seconds,
+      state.duration,
+   );
+
+   player.play()?;
+   wait_for_position(&player, played_seconds as f64)?;
+   player.pause()?;
+   thread::sleep(Duration::from_secs(paused_seconds as u64));
+   player.play()?;
+   wait_for_position(&player, resume_end_seconds as f64)?;
+   player.stop()?;
+
+   Ok(())
+}
+
 #[test]
 #[ignore = "manual audible check; plays audio-player output through rodio"]
 fn plays_fixture_at_one_x_with_seek_from_five_seconds_to_two_seconds() -> Result<(), Box<dyn Error>>
@@ -133,6 +165,19 @@ fn plays_fixture_at_one_x_with_seek_from_five_seconds_to_two_seconds() -> Result
 #[ignore = "manual audible check; plays audio-player output through rodio"]
 fn plays_fixture_at_one_point_two_five_x() -> Result<(), Box<dyn Error>> {
    play_fixture_at_rate(1.25, 5)
+}
+
+#[test]
+#[ignore = "manual audible check; plays audio-player output through rodio"]
+fn plays_fixture_at_one_x_with_pause_for_five_seconds_then_resume() -> Result<(), Box<dyn Error>> {
+   play_fixture_at_rate_with_pause_and_resume(1.0, 3, 5, 5)
+}
+
+#[test]
+#[ignore = "manual audible check; plays audio-player output through rodio"]
+fn plays_fixture_at_one_point_two_five_x_with_pause_for_five_seconds_then_resume()
+-> Result<(), Box<dyn Error>> {
+   play_fixture_at_rate_with_pause_and_resume(1.25, 3, 5, 5)
 }
 
 #[test]

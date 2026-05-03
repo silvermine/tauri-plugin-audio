@@ -6,6 +6,7 @@ use std::time::Duration;
 use rodio::{Decoder, Sample, Source};
 
 use super::http::{HttpAudioReader, RemoteSourceDescriptor, fetch_remote_source_descriptor};
+use super::resume_fade::{ResumeFadeHandle, ResumeFadeSource};
 use super::stretch::StretchSource;
 
 use crate::error::{Error, Result};
@@ -29,6 +30,7 @@ pub(crate) struct OpenedSource {
    pub(crate) source: BoxedSource,
    pub(crate) duration: f64,
    pub(crate) seek_strategy: SeekStrategy,
+   pub(crate) resume_fade: Option<ResumeFadeHandle>,
 }
 
 pub(crate) fn load_source_descriptor(src: &str) -> Result<SourceDescriptor> {
@@ -65,16 +67,21 @@ pub(crate) fn open_source_at(
       .total_duration()
       .map(|value| value.as_secs_f64())
       .unwrap_or(0.0);
-   let source = if (playback_rate - 1.0).abs() > f64::EPSILON {
-      Box::new(StretchSource::new(decoded_source, playback_rate)) as BoxedSource
+   let (source, resume_fade) = if (playback_rate - 1.0).abs() > f64::EPSILON {
+      let (source, resume_fade) = ResumeFadeSource::new(
+         StretchSource::new(decoded_source, playback_rate),
+      );
+
+      (Box::new(source) as BoxedSource, Some(resume_fade))
    } else {
-      decoded_source
+      (decoded_source, None)
    };
 
    Ok(OpenedSource {
       source,
       duration,
       seek_strategy,
+      resume_fade,
    })
 }
 
