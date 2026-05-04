@@ -2,7 +2,7 @@ use crate::port::Stretch;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PlaybackStreamError {
-   #[error("playback_rate must be finite and non-negative, got {0}")]
+   #[error("playback_rate must be finite and greater than zero, got {0}")]
    InvalidPlaybackRate(f32),
 
    #[error("channel count must be greater than zero, got {channels}")]
@@ -10,6 +10,20 @@ pub enum PlaybackStreamError {
 
    #[error("sample_rate must be finite and greater than zero, got {sample_rate}")]
    InvalidSampleRate { sample_rate: f32 },
+
+   #[error("block_samples must be at least {minimum_block_samples}, got {block_samples}")]
+   InvalidBlockSamples {
+      block_samples: usize,
+      minimum_block_samples: usize,
+   },
+
+   #[error(
+      "interval_samples must be at least {minimum_interval_samples}, got {interval_samples}"
+   )]
+   InvalidIntervalSamples {
+      interval_samples: usize,
+      minimum_interval_samples: usize,
+   },
 
    #[error(
       "input channel count {actual_channels} must match configured channel count {expected_channels}"
@@ -78,6 +92,9 @@ pub struct PlaybackStream {
 /// Backwards-compatible name for the streaming playback wrapper.
 pub type PlaybackRateController = PlaybackStream;
 
+const MIN_BLOCK_SAMPLES: usize = 4;
+const MIN_INTERVAL_SAMPLES: usize = 1;
+
 impl PlaybackStream {
    pub fn new(channels: usize, sample_rate: f32) -> Result<Self, PlaybackStreamError> {
       Self::with_rate(channels, sample_rate, 1.0)
@@ -91,11 +108,13 @@ impl PlaybackStream {
       validate_channels(channels)?;
       validate_sample_rate(sample_rate)?;
       validate_playback_rate(playback_rate)?;
+      let (block_samples, interval_samples) = preset_default_sizes(sample_rate);
+      validate_stretch_configuration(block_samples, interval_samples)?;
       let mut stretch = Stretch::new();
       // Streaming-first default: upstream recommends split computation for
       // stricter real-time situations. The source-tracking `Stretch` API
       // still exposes the exact Signalsmith default for callers who want it.
-      stretch.preset_default(channels, sample_rate, true);
+      stretch.configure(channels, block_samples, interval_samples, true);
       Self::from_stretch(stretch, playback_rate)
    }
 
@@ -108,6 +127,7 @@ impl PlaybackStream {
    ) -> Result<Self, PlaybackStreamError> {
       validate_channels(channels)?;
       validate_playback_rate(playback_rate)?;
+      validate_stretch_configuration(block_samples, interval_samples)?;
       let mut stretch = Stretch::new();
       stretch.configure(channels, block_samples, interval_samples, split_computation);
       Self::from_stretch(stretch, playback_rate)
@@ -361,6 +381,7 @@ impl PlaybackStream {
          channel.resize(output_samples, 0.0);
       }
    }
+
 }
 
 fn validate_channels(channels: usize) -> Result<(), PlaybackStreamError> {
@@ -380,10 +401,47 @@ fn validate_sample_rate(sample_rate: f32) -> Result<(), PlaybackStreamError> {
 }
 
 fn validate_playback_rate(playback_rate: f32) -> Result<(), PlaybackStreamError> {
-   if playback_rate.is_finite() && playback_rate >= 0.0 {
+   if playback_rate.is_finite() && playback_rate > 0.0 {
       Ok(())
    } else {
       Err(PlaybackStreamError::InvalidPlaybackRate(playback_rate))
+   }
+}
+
+fn preset_default_sizes(sample_rate: f32) -> (usize, usize) {
+   (
+      (sample_rate * 0.12) as usize,
+      (sample_rate * 0.03) as usize,
+   )
+}
+
+fn validate_stretch_configuration(
+   block_samples: usize,
+   interval_samples: usize,
+) -> Result<(), PlaybackStreamError> {
+   validate_block_samples(block_samples)?;
+   validate_interval_samples(interval_samples)
+}
+
+fn validate_block_samples(block_samples: usize) -> Result<(), PlaybackStreamError> {
+   if block_samples >= MIN_BLOCK_SAMPLES {
+      Ok(())
+   } else {
+      Err(PlaybackStreamError::InvalidBlockSamples {
+         block_samples,
+         minimum_block_samples: MIN_BLOCK_SAMPLES,
+      })
+   }
+}
+
+fn validate_interval_samples(interval_samples: usize) -> Result<(), PlaybackStreamError> {
+   if interval_samples >= MIN_INTERVAL_SAMPLES {
+      Ok(())
+   } else {
+      Err(PlaybackStreamError::InvalidIntervalSamples {
+         interval_samples,
+         minimum_interval_samples: MIN_INTERVAL_SAMPLES,
+      })
    }
 }
 
