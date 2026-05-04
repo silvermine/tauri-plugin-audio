@@ -325,6 +325,7 @@ impl RodioAudioPlayer {
                   source_descriptor,
                   target_time,
                   previous_time,
+                  None,
                   seek_generation,
                )?
             }
@@ -341,6 +342,7 @@ impl RodioAudioPlayer {
       source_descriptor: SourceDescriptor,
       target_time: f64,
       previous_time: f64,
+      previous_playback_rate: Option<f64>,
       seek_generation: u64,
    ) -> Result<PlayerState> {
       let playback_rate = lock_inner(&self.inner).state.playback_rate;
@@ -352,7 +354,11 @@ impl RodioAudioPlayer {
             let mut inner = lock_inner(&self.inner);
 
             if inner.seek_generation == seek_generation {
-               inner.state.current_time = previous_time;
+               restore_reopen_failure_state(
+                  &mut inner.state,
+                  previous_time,
+                  previous_playback_rate,
+               );
 
                if let Some(ctx) = &inner.playback {
                   ctx.sink.set_volume(effective_volume(&inner.state));
@@ -485,6 +491,7 @@ impl RodioAudioPlayer {
             source_descriptor: SourceDescriptor,
             target_time: f64,
             previous_time: f64,
+            previous_playback_rate: f64,
             seek_generation: u64,
          },
       }
@@ -492,10 +499,16 @@ impl RodioAudioPlayer {
       let action = {
          let mut inner = lock_inner(&self.inner);
          let previous_time = inner.state.current_time;
+         let previous_playback_rate = inner.state.playback_rate;
 
          transitions::set_playback_rate(&mut inner.state, rate)?;
 
-         if let Some(source_descriptor) = inner
+         if !playback_rate_change_requires_reopen(
+            previous_playback_rate,
+            inner.state.playback_rate,
+         ) {
+            PlaybackRateAction::Complete(inner.state.clone())
+         } else if let Some(source_descriptor) = inner
             .playback
             .as_ref()
             .map(|ctx| ctx.source.clone())
@@ -512,6 +525,7 @@ impl RodioAudioPlayer {
                source_descriptor,
                target_time: inner.state.current_time,
                previous_time,
+               previous_playback_rate,
                seek_generation,
             }
          } else {
@@ -525,11 +539,13 @@ impl RodioAudioPlayer {
             source_descriptor,
             target_time,
             previous_time,
+            previous_playback_rate,
             seek_generation,
          } => self.reopen_playback_at(
             source_descriptor,
             target_time,
             previous_time,
+            Some(previous_playback_rate),
             seek_generation,
          )?,
       };
@@ -676,5 +692,82 @@ fn effective_volume(state: &PlayerState) -> f32 {
       0.0
    } else {
       state.volume as f32
+   }
+}
+
+fn restore_reopen_failure_state(
+   state: &mut PlayerState,
+   previous_time: f64,
+   previous_playback_rate: Option<f64>,
+) {
+   state.current_time = previous_time;
+
+   if let Some(previous_playback_rate) = previous_playback_rate {
+      state.playback_rate = previous_playback_rate;
+   }
+}
+
+fn playback_rate_change_requires_reopen(
+   previous_playback_rate: f64,
+   playback_rate: f64,
+) -> bool {
+   previous_playback_rate != playback_rate
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn playback_rate_change_requires_reopen_when_rate_changes() {
+      assert!(playback_rate_change_requires_reopen(1.0, 1.25));
+   }
+
+   #[test]
+   fn playback_rate_change_requires_reopen_is_false_when_clamping_keeps_same_rate() {
+      let mut state = PlayerState {
+         playback_rate: 0.25,
+         ..Default::default()
+      };
+      let previous_playback_rate = state.playback_rate;
+
+      transitions::set_playback_rate(&mut state, 0.0).unwrap();
+
+      assert!(!playback_rate_change_requires_reopen(
+         previous_playback_rate,
+         state.playback_rate,
+      ));
+   }
+
+   #[test]
+   fn restore_reopen_failure_state_keeps_playback_rate_for_seek_failures() {
+      let mut state = PlayerState {
+         status: PlaybackStatus::Playing,
+         current_time: 12.0,
+         playback_rate: 1.5,
+         ..Default::default()
+      };
+
+      restore_reopen_failure_state(&mut state, 4.0, None);
+
+      assert_eq!(state.status, PlaybackStatus::Playing);
+      assert_eq!(state.current_time, 4.0);
+      assert_eq!(state.playback_rate, 1.5);
+   }
+
+   #[test]
+   fn restore_reopen_failure_state_restores_previous_playback_rate() {
+      let mut state = PlayerState {
+         status: PlaybackStatus::Playing,
+         current_time: 12.0,
+         playback_rate: 2.0,
+         ..Default::default()
+      };
+
+      restore_reopen_failure_state(&mut state, 4.0, Some(1.25));
+
+      assert_eq!(state.status, PlaybackStatus::Playing);
+      assert_eq!(state.current_time, 4.0);
+      assert_eq!(state.playback_rate, 1.25);
    }
 }
