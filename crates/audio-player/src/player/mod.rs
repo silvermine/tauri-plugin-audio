@@ -107,20 +107,19 @@ impl RodioAudioPlayer {
    pub fn load(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
       let meta = metadata.unwrap_or_default();
 
-      let (load_generation, playback_rate) = {
+      let load_generation = {
          let mut inner = lock_inner(&self.inner);
          transitions::begin_load(&mut inner.state, src, &meta)?;
          inner.load_generation = inner.load_generation.wrapping_add(1);
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let load_generation = inner.load_generation;
-         let playback_rate = inner.state.playback_rate;
          let snapshot = inner.state.clone();
          drop(inner);
          (self.on_changed)(&snapshot);
-         (load_generation, playback_rate)
+         load_generation
       };
 
-      let result = self.load_inner(src, &meta, load_generation, playback_rate);
+      let result = self.load_inner(src, &meta, load_generation);
 
       match result {
          Ok(snapshot) => {
@@ -147,40 +146,51 @@ impl RodioAudioPlayer {
       src: &str,
       meta: &AudioMetadata,
       load_generation: u64,
-      playback_rate: f64,
    ) -> Result<PlayerState> {
       let descriptor = load_source_descriptor(src)?;
-      let opened_source = open_source_at(&descriptor, 0.0, playback_rate)?;
-      let duration = opened_source.duration;
 
-      // Create a new sink, append the decoded source, and pause immediately
-      // so playback waits for an explicit play() call.
-      let sink = Player::connect_new(self.output_sink.mixer());
-      sink.pause();
-      sink.append(opened_source.source);
+      let mut playback_rate = lock_inner(&self.inner).state.playback_rate;
 
-      let mut inner = lock_inner(&self.inner);
+      loop {
+         let opened_source = open_source_at(&descriptor, 0.0, playback_rate)?;
+         let duration = opened_source.duration;
 
-      if inner.load_generation != load_generation {
-         return Err(Error::InvalidState("Load request was canceled".into()));
+         // Create a new sink, append the decoded source, and pause immediately
+         // so playback waits for an explicit play() call.
+         let sink = Player::connect_new(self.output_sink.mixer());
+         sink.pause();
+         sink.append(opened_source.source);
+
+         let mut inner = lock_inner(&self.inner);
+
+         if inner.load_generation != load_generation {
+            sink.stop();
+            return Err(Error::InvalidState("Load request was canceled".into()));
+         }
+
+         if inner.state.playback_rate != playback_rate {
+            playback_rate = inner.state.playback_rate;
+            sink.stop();
+            continue;
+         }
+
+         transitions::load(&mut inner.state, src, meta, duration)?;
+
+         Self::stop_monitor(&inner);
+
+         sink.set_volume(effective_volume(&inner.state));
+
+         inner.playback = Some(PlaybackContext {
+            sink,
+            source: descriptor.clone(),
+            duration,
+            position_offset: 0.0,
+            seek_strategy: opened_source.seek_strategy,
+            resume_fade: opened_source.resume_fade,
+         });
+
+         return Ok(inner.state.clone());
       }
-
-      transitions::load(&mut inner.state, src, meta, duration)?;
-
-      Self::stop_monitor(&inner);
-
-      sink.set_volume(effective_volume(&inner.state));
-
-      inner.playback = Some(PlaybackContext {
-         sink,
-         source: descriptor,
-         duration,
-         position_offset: 0.0,
-         seek_strategy: opened_source.seek_strategy,
-         resume_fade: opened_source.resume_fade,
-      });
-
-      Ok(inner.state.clone())
    }
 
    pub fn play(&self) -> Result<AudioActionResponse> {
@@ -708,10 +718,17 @@ fn playback_rate_change_requires_reopen(previous_playback_rate: f64, playback_ra
 #[cfg(test)]
 mod tests {
    use super::*;
+   use std::sync::atomic::AtomicBool;
+   use std::sync::{Arc, Mutex};
 
-   #[test]
-   fn playback_rate_change_requires_reopen_when_rate_changes() {
-      assert!(playback_rate_change_requires_reopen(1.0, 1.25));
+   fn inner_with_state(state: PlayerState) -> Inner {
+      Inner {
+         state,
+         playback: None,
+         monitor_stop: Arc::new(AtomicBool::new(true)),
+         load_generation: 0,
+         seek_generation: 0,
+      }
    }
 
    #[test]
@@ -760,5 +777,103 @@ mod tests {
       assert_eq!(state.status, PlaybackStatus::Playing);
       assert_eq!(state.current_time, 4.0);
       assert_eq!(state.playback_rate, 1.25);
+   }
+
+   #[test]
+   fn finish_playback_as_ended_uses_duration_when_known() {
+      let mut inner = inner_with_state(PlayerState {
+         status: PlaybackStatus::Playing,
+         current_time: 42.0,
+         ..Default::default()
+      });
+
+      let snapshot = finish_playback_as_ended(&mut inner, 120.0, 119.25);
+
+      assert_eq!(snapshot.status, PlaybackStatus::Ended);
+      assert_eq!(snapshot.current_time, 120.0);
+      assert_eq!(inner.state.status, PlaybackStatus::Ended);
+      assert_eq!(inner.state.current_time, 120.0);
+   }
+
+   #[test]
+   fn finish_playback_as_ended_falls_back_to_position_when_duration_unknown() {
+      let mut inner = inner_with_state(PlayerState {
+         status: PlaybackStatus::Playing,
+         current_time: 42.0,
+         ..Default::default()
+      });
+
+      let snapshot = finish_playback_as_ended(&mut inner, 0.0, 119.25);
+
+      assert_eq!(snapshot.status, PlaybackStatus::Ended);
+      assert_eq!(snapshot.current_time, 119.25);
+      assert_eq!(inner.state.status, PlaybackStatus::Ended);
+      assert_eq!(inner.state.current_time, 119.25);
+   }
+
+   #[test]
+   fn finish_load_as_error_updates_matching_loading_request() {
+      let mut inner = inner_with_state(PlayerState {
+         status: PlaybackStatus::Loading,
+         src: Some("fixture.mp3".to_string()),
+         ..Default::default()
+      });
+      inner.load_generation = 7;
+
+      let snapshot = finish_load_as_error(&mut inner, 7, "decode failed".to_string())
+         .expect("matching loading request should transition to error");
+
+      assert_eq!(snapshot.status, PlaybackStatus::Error);
+      assert_eq!(snapshot.error.as_deref(), Some("decode failed"));
+      assert_eq!(inner.state.status, PlaybackStatus::Error);
+      assert_eq!(inner.state.error.as_deref(), Some("decode failed"));
+   }
+
+   #[test]
+   fn finish_load_as_error_ignores_stale_or_non_loading_requests() {
+      let mut stale_inner = inner_with_state(PlayerState {
+         status: PlaybackStatus::Loading,
+         ..Default::default()
+      });
+      stale_inner.load_generation = 7;
+
+      let stale_snapshot = finish_load_as_error(&mut stale_inner, 6, "decode failed".to_string());
+
+      assert!(stale_snapshot.is_none());
+      assert_eq!(stale_inner.state.status, PlaybackStatus::Loading);
+      assert!(stale_inner.state.error.is_none());
+
+      let mut ready_inner = inner_with_state(PlayerState {
+         status: PlaybackStatus::Ready,
+         ..Default::default()
+      });
+      ready_inner.load_generation = 7;
+
+      let ready_snapshot = finish_load_as_error(&mut ready_inner, 7, "decode failed".to_string());
+
+      assert!(ready_snapshot.is_none());
+      assert_eq!(ready_inner.state.status, PlaybackStatus::Ready);
+      assert!(ready_inner.state.error.is_none());
+   }
+
+   #[test]
+   fn lock_inner_recovers_from_poisoned_mutex() {
+      let mutex = Arc::new(Mutex::new(inner_with_state(PlayerState {
+         status: PlaybackStatus::Ready,
+         volume: 0.4,
+         ..Default::default()
+      })));
+      let mutex_for_thread = Arc::clone(&mutex);
+
+      let _ = std::thread::spawn(move || {
+         let _guard = mutex_for_thread.lock().unwrap();
+         panic!("poison test mutex");
+      })
+      .join();
+
+      let guard = lock_inner(mutex.as_ref());
+
+      assert_eq!(guard.state.status, PlaybackStatus::Ready);
+      assert_eq!(guard.state.volume, 0.4);
    }
 }
