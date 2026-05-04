@@ -68,9 +68,8 @@ pub(crate) fn open_source_at(
       .map(|value| value.as_secs_f64())
       .unwrap_or(0.0);
    let (source, resume_fade) = if (playback_rate - 1.0).abs() > f64::EPSILON {
-      let (source, resume_fade) = ResumeFadeSource::new(
-         StretchSource::new(decoded_source, playback_rate),
-      );
+      let (source, resume_fade) =
+         ResumeFadeSource::new(StretchSource::new(decoded_source, playback_rate));
 
       (Box::new(source) as BoxedSource, Some(resume_fade))
    } else {

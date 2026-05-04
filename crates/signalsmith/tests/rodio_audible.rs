@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use rodio::stream::MixerDeviceSink;
-use rodio::source::Zero;
 use rodio::source::SeekError as RodioSeekError;
+use rodio::source::Zero;
+use rodio::stream::MixerDeviceSink;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 use signalsmith::PlaybackStream;
 
@@ -58,7 +58,12 @@ impl FixtureSource {
    }
 
    fn assert_length(&self, required_frames: usize, label: &str) {
-      assert_fixture_length(self.total_duration, self.sample_rate_hz, required_frames, label);
+      assert_fixture_length(
+         self.total_duration,
+         self.sample_rate_hz,
+         required_frames,
+         label,
+      );
    }
 
    fn into_streaming_source(
@@ -325,9 +330,7 @@ impl StreamingPlaybackSource {
             remaining_frames: remaining_frames - 1,
             total_frames,
          },
-         SeekTransition::FadingOut { target_frame, .. } => SeekTransition::Pending {
-            target_frame,
-         },
+         SeekTransition::FadingOut { target_frame, .. } => SeekTransition::Pending { target_frame },
          SeekTransition::FadingIn {
             remaining_frames,
             total_frames,
@@ -442,7 +445,8 @@ impl Source for StreamingPlaybackSource {
    }
 
    fn try_seek(&mut self, position: Duration) -> Result<(), RodioSeekError> {
-      let seek_frame = ((position.as_secs_f64() * self.sample_rate_hz.get() as f64).floor() as usize)
+      let seek_frame = ((position.as_secs_f64() * self.sample_rate_hz.get() as f64).floor()
+         as usize)
          .min(self.current_segment_end_frame);
 
       self.schedule_seek_to_frame(seek_frame)
@@ -542,9 +546,8 @@ where
       "second segment exceeds fixture length"
    );
 
-   let (_sink, player) = open_player_with_source(
-      fixture.into_streaming_source(playback_rate, available_frames),
-   )?;
+   let (_sink, player) =
+      open_player_with_source(fixture.into_streaming_source(playback_rate, available_frames))?;
 
    wait_for_played_source_seconds(playback_rate, first_segment_end_seconds as f64);
    seek_operation(&player, Duration::from_secs_f64(seek_seconds as f64))?;
@@ -592,16 +595,10 @@ fn play_fixture_at_rate_with_seek(
       "second segment exceeds audible preview length"
    );
 
-   play_streaming_audio(fixture.into_streaming_source(
-      playback_rate,
-      first_segment_end_frames,
-   ))?;
+   play_streaming_audio(fixture.into_streaming_source(playback_rate, first_segment_end_frames))?;
 
-   let second_source = open_seeked_fixture_source(
-      playback_rate,
-      seek_frame,
-      second_segment_end_frame,
-   )?;
+   let second_source =
+      open_seeked_fixture_source(playback_rate, seek_frame, second_segment_end_frame)?;
    play_streaming_audio(second_source)
 }
 
@@ -635,9 +632,8 @@ fn play_fixture_at_rate_with_pause_and_resume(
    );
    fixture.assert_length(source_frames, "resume preview length");
 
-   let (_sink, player) = open_player_with_source(
-      fixture.into_streaming_source(playback_rate, source_frames),
-   )?;
+   let (_sink, player) =
+      open_player_with_source(fixture.into_streaming_source(playback_rate, source_frames))?;
 
    wait_for_played_source_seconds(playback_rate, played_seconds as f64);
    player.pause();
@@ -689,9 +685,8 @@ fn play_fixture_at_rate_with_silence_and_resume(
    );
    fixture.assert_length(source_frames, "resume preview length");
 
-   let (sink, player) = open_player_with_source(
-      fixture.into_streaming_source(playback_rate, source_frames),
-   )?;
+   let (sink, player) =
+      open_player_with_source(fixture.into_streaming_source(playback_rate, source_frames))?;
 
    wait_for_played_source_seconds(playback_rate, played_seconds as f64);
    player.pause();
@@ -761,8 +756,7 @@ fn play_supports_significantly_faster_playback_rate() -> Result<(), Box<dyn Erro
 // Seek
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn seek_supports_faded_direct_seek_during_playback()
--> Result<(), Box<dyn Error>> {
+fn seek_supports_faded_direct_seek_during_playback() -> Result<(), Box<dyn Error>> {
    // There are no clicks when SEEK_FADE_FRAMES is around 20+ (about 400 ms to fade
    // out and back in at 44 kHz), so this is probably because the fading process is
    // not only addressing discontinuities, but is also masking algorithm
@@ -773,8 +767,7 @@ fn seek_supports_faded_direct_seek_during_playback()
 
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn seek_supports_reopened_source_seek()
--> Result<(), Box<dyn Error>> {
+fn seek_supports_reopened_source_seek() -> Result<(), Box<dyn Error>> {
    // no click
    play_fixture_at_rate_with_seek(1.25, 4, 2, SOURCE_DURATION_SECONDS)
 }
@@ -782,32 +775,28 @@ fn seek_supports_reopened_source_seek()
 // Resume
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn resume_continues_after_pause()
--> Result<(), Box<dyn Error>> {
+fn resume_continues_after_pause() -> Result<(), Box<dyn Error>> {
    // clicks
    play_fixture_at_rate_with_pause_and_resume(1.25, 3, 5, SOURCE_DURATION_SECONDS)
 }
 
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn resume_continues_after_reopening_source()
--> Result<(), Box<dyn Error>> {
+fn resume_continues_after_reopening_source() -> Result<(), Box<dyn Error>> {
    // clicks
    play_fixture_at_rate_with_pause_and_reopened_resume(1.25, 3, 5, SOURCE_DURATION_SECONDS)
 }
 
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn resume_continues_after_silence_gap()
--> Result<(), Box<dyn Error>> {
+fn resume_continues_after_silence_gap() -> Result<(), Box<dyn Error>> {
    // clicks
    play_fixture_at_rate_with_silence_and_resume(1.25, 3, 5, SOURCE_DURATION_SECONDS)
 }
 
 #[test]
 #[ignore = "manual audible check; plays rendered output through rodio"]
-fn resume_with_source_fade_in_continues_after_same_source_pause()
--> Result<(), Box<dyn Error>> {
+fn resume_with_source_fade_in_continues_after_same_source_pause() -> Result<(), Box<dyn Error>> {
    // no clicks when SEEK_FADE_FRAMES is around 10+
    play_fixture_at_rate_with_source_fade_resume(1.25, 3, 5, SOURCE_DURATION_SECONDS)
 }

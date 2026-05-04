@@ -115,7 +115,9 @@ impl StretchSource {
       }
 
       if available_input_frames < input_frames {
-         while output_frames > 0 && self.stream.input_samples_for_output(output_frames) > available_input_frames {
+         while output_frames > 0
+            && self.stream.input_samples_for_output(output_frames) > available_input_frames
+         {
             output_frames -= 1;
          }
 
@@ -129,7 +131,9 @@ impl StretchSource {
                .iter()
                .copied(),
          );
-         self.input_buffer.truncate(input_frames * self.channel_count());
+         self
+            .input_buffer
+            .truncate(input_frames * self.channel_count());
       }
 
       self

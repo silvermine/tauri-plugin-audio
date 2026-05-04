@@ -24,172 +24,172 @@ use crate::{OnChanged, OnTimeUpdate, transitions};
 /// and end-of-track detection, and a state machine matching the plugin's
 /// [`PlaybackStatus`] model.
 pub struct RodioAudioPlayer {
-    inner: Arc<Mutex<Inner>>,
-    output_sink: MixerDeviceSink,
-    on_changed: OnChanged,
-    on_time_update: OnTimeUpdate,
+   inner: Arc<Mutex<Inner>>,
+   output_sink: MixerDeviceSink,
+   on_changed: OnChanged,
+   on_time_update: OnTimeUpdate,
 }
 
 struct Inner {
-    state: PlayerState,
-    playback: Option<PlaybackContext>,
-    monitor_stop: Arc<AtomicBool>,
-    load_generation: u64,
-    seek_generation: u64,
+   state: PlayerState,
+   playback: Option<PlaybackContext>,
+   monitor_stop: Arc<AtomicBool>,
+   load_generation: u64,
+   seek_generation: u64,
 }
 
 struct PlaybackContext {
-    sink: Player,
-    source: SourceDescriptor,
-    duration: f64,
-    position_offset: f64,
-    seek_strategy: SeekStrategy,
-    resume_fade: Option<ResumeFadeHandle>,
+   sink: Player,
+   source: SourceDescriptor,
+   duration: f64,
+   position_offset: f64,
+   seek_strategy: SeekStrategy,
+   resume_fade: Option<ResumeFadeHandle>,
 }
 
 impl RodioAudioPlayer {
-    /// Creates a new Rodio-backed audio player.
-    ///
-    /// Opens the default audio output device. Returns an error
-    /// if no audio device is available.
-    pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Self> {
-        let mut output_sink = open_audio_output()?;
-        output_sink.log_on_drop(false);
+   /// Creates a new Rodio-backed audio player.
+   ///
+   /// Opens the default audio output device. Returns an error
+   /// if no audio device is available.
+   pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Self> {
+      let mut output_sink = open_audio_output()?;
+      output_sink.log_on_drop(false);
 
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                state: PlayerState::default(),
-                playback: None,
-                monitor_stop: Arc::new(AtomicBool::new(true)),
-                load_generation: 0,
-                seek_generation: 0,
-            })),
-            output_sink,
-            on_changed,
-            on_time_update,
-        })
-    }
+      Ok(Self {
+         inner: Arc::new(Mutex::new(Inner {
+            state: PlayerState::default(),
+            playback: None,
+            monitor_stop: Arc::new(AtomicBool::new(true)),
+            load_generation: 0,
+            seek_generation: 0,
+         })),
+         output_sink,
+         on_changed,
+         on_time_update,
+      })
+   }
 
-    /// Stops the monitor thread by setting the flag.
-    fn stop_monitor(inner: &Inner) {
-        inner.monitor_stop.store(true, Ordering::Relaxed);
-    }
+   /// Stops the monitor thread by setting the flag.
+   fn stop_monitor(inner: &Inner) {
+      inner.monitor_stop.store(true, Ordering::Relaxed);
+   }
 
-    /// Spawns a new monitor thread for time updates and end-of-track detection.
-    ///
-    /// The old monitor thread may briefly overlap (up to 250ms) until it
-    /// observes the stop flag on its next poll. This is harmless — any
-    /// duplicate time updates are benign, and the state is already updated
-    /// under the mutex before the new monitor starts, so the old one cannot
-    /// trigger a spurious Ended transition.
-    fn start_monitor(&self, inner: &mut Inner) {
-        let stop = Arc::new(AtomicBool::new(false));
-        inner.monitor_stop = stop.clone();
+   /// Spawns a new monitor thread for time updates and end-of-track detection.
+   ///
+   /// The old monitor thread may briefly overlap (up to 250ms) until it
+   /// observes the stop flag on its next poll. This is harmless — any
+   /// duplicate time updates are benign, and the state is already updated
+   /// under the mutex before the new monitor starts, so the old one cannot
+   /// trigger a spurious Ended transition.
+   fn start_monitor(&self, inner: &mut Inner) {
+      let stop = Arc::new(AtomicBool::new(false));
+      inner.monitor_stop = stop.clone();
 
-        let inner_arc = Arc::clone(&self.inner);
-        let on_changed = Arc::clone(&self.on_changed);
-        let on_time_update = Arc::clone(&self.on_time_update);
+      let inner_arc = Arc::clone(&self.inner);
+      let on_changed = Arc::clone(&self.on_changed);
+      let on_time_update = Arc::clone(&self.on_time_update);
 
-        if let Err(e) = std::thread::Builder::new()
-            .name("audio-monitor".into())
-            .spawn(move || {
-                monitor_loop(stop, inner_arc, on_changed, on_time_update);
-            })
-        {
-            warn!("Failed to spawn audio monitor thread: {e}");
-        }
-    }
+      if let Err(e) = std::thread::Builder::new()
+         .name("audio-monitor".into())
+         .spawn(move || {
+            monitor_loop(stop, inner_arc, on_changed, on_time_update);
+         })
+      {
+         warn!("Failed to spawn audio monitor thread: {e}");
+      }
+   }
 
-    pub fn get_state(&self) -> PlayerState {
-        lock_inner(&self.inner).state.clone()
-    }
+   pub fn get_state(&self) -> PlayerState {
+      lock_inner(&self.inner).state.clone()
+   }
 
-    pub fn load(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
-        let meta = metadata.unwrap_or_default();
+   pub fn load(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
+      let meta = metadata.unwrap_or_default();
 
-        let (load_generation, playback_rate) = {
-            let mut inner = lock_inner(&self.inner);
-            transitions::begin_load(&mut inner.state, src, &meta)?;
-            inner.load_generation = inner.load_generation.wrapping_add(1);
-            inner.seek_generation = inner.seek_generation.wrapping_add(1);
-            let load_generation = inner.load_generation;
-            let playback_rate = inner.state.playback_rate;
-            let snapshot = inner.state.clone();
-            drop(inner);
+      let (load_generation, playback_rate) = {
+         let mut inner = lock_inner(&self.inner);
+         transitions::begin_load(&mut inner.state, src, &meta)?;
+         inner.load_generation = inner.load_generation.wrapping_add(1);
+         inner.seek_generation = inner.seek_generation.wrapping_add(1);
+         let load_generation = inner.load_generation;
+         let playback_rate = inner.state.playback_rate;
+         let snapshot = inner.state.clone();
+         drop(inner);
+         (self.on_changed)(&snapshot);
+         (load_generation, playback_rate)
+      };
+
+      let result = self.load_inner(src, &meta, load_generation, playback_rate);
+
+      match result {
+         Ok(snapshot) => {
             (self.on_changed)(&snapshot);
-            (load_generation, playback_rate)
-        };
+            Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ready))
+         }
+         Err(error) => {
+            let snapshot = {
+               let mut inner = lock_inner(&self.inner);
+               finish_load_as_error(&mut inner, load_generation, error.to_string())
+            };
 
-        let result = self.load_inner(src, &meta, load_generation, playback_rate);
-
-        match result {
-            Ok(snapshot) => {
-                (self.on_changed)(&snapshot);
-                Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ready))
+            if let Some(snapshot) = snapshot {
+               (self.on_changed)(&snapshot);
             }
-            Err(error) => {
-                let snapshot = {
-                    let mut inner = lock_inner(&self.inner);
-                    finish_load_as_error(&mut inner, load_generation, error.to_string())
-                };
 
-                if let Some(snapshot) = snapshot {
-                    (self.on_changed)(&snapshot);
-                }
+            Err(error)
+         }
+      }
+   }
 
-                Err(error)
-            }
-        }
-    }
+   fn load_inner(
+      &self,
+      src: &str,
+      meta: &AudioMetadata,
+      load_generation: u64,
+      playback_rate: f64,
+   ) -> Result<PlayerState> {
+      let descriptor = load_source_descriptor(src)?;
+      let opened_source = open_source_at(&descriptor, 0.0, playback_rate)?;
+      let duration = opened_source.duration;
 
-    fn load_inner(
-       &self,
-       src: &str,
-       meta: &AudioMetadata,
-       load_generation: u64,
-       playback_rate: f64,
-    ) -> Result<PlayerState> {
-       let descriptor = load_source_descriptor(src)?;
-       let opened_source = open_source_at(&descriptor, 0.0, playback_rate)?;
-       let duration = opened_source.duration;
+      // Create a new sink, append the decoded source, and pause immediately
+      // so playback waits for an explicit play() call.
+      let sink = Player::connect_new(self.output_sink.mixer());
+      sink.pause();
+      sink.append(opened_source.source);
 
-       // Create a new sink, append the decoded source, and pause immediately
-       // so playback waits for an explicit play() call.
-       let sink = Player::connect_new(self.output_sink.mixer());
-       sink.pause();
-       sink.append(opened_source.source);
+      let mut inner = lock_inner(&self.inner);
 
-       let mut inner = lock_inner(&self.inner);
+      if inner.load_generation != load_generation {
+         return Err(Error::InvalidState("Load request was canceled".into()));
+      }
 
-       if inner.load_generation != load_generation {
-          return Err(Error::InvalidState("Load request was canceled".into()));
-       }
+      transitions::load(&mut inner.state, src, meta, duration)?;
 
-       transitions::load(&mut inner.state, src, meta, duration)?;
+      Self::stop_monitor(&inner);
 
-       Self::stop_monitor(&inner);
+      sink.set_volume(effective_volume(&inner.state));
 
-       sink.set_volume(effective_volume(&inner.state));
+      inner.playback = Some(PlaybackContext {
+         sink,
+         source: descriptor,
+         duration,
+         position_offset: 0.0,
+         seek_strategy: opened_source.seek_strategy,
+         resume_fade: opened_source.resume_fade,
+      });
 
-       inner.playback = Some(PlaybackContext {
-          sink,
-          source: descriptor,
-          duration,
-          position_offset: 0.0,
-          seek_strategy: opened_source.seek_strategy,
-          resume_fade: opened_source.resume_fade,
-       });
+      Ok(inner.state.clone())
+   }
 
-       Ok(inner.state.clone())
-    }
-
-    pub fn play(&self) -> Result<AudioActionResponse> {
-       let snapshot = {
-          let mut inner = lock_inner(&self.inner);
-          let was_paused = inner.state.status == PlaybackStatus::Paused;
-          let is_ended = inner.state.status == PlaybackStatus::Ended;
-          let mut replayed_from_start = false;
-          let playback_rate = inner.state.playback_rate;
+   pub fn play(&self) -> Result<AudioActionResponse> {
+      let snapshot = {
+         let mut inner = lock_inner(&self.inner);
+         let was_paused = inner.state.status == PlaybackStatus::Paused;
+         let is_ended = inner.state.status == PlaybackStatus::Ended;
+         let mut replayed_from_start = false;
+         let playback_rate = inner.state.playback_rate;
 
          if is_ended
             && let Some(ctx) = &mut inner.playback
@@ -211,9 +211,7 @@ impl RodioAudioPlayer {
          }
 
          if let Some(ctx) = &inner.playback {
-            if was_paused
-               && let Some(resume_fade) = &ctx.resume_fade
-            {
+            if was_paused && let Some(resume_fade) = &ctx.resume_fade {
                resume_fade.request_fade_in();
             }
 
@@ -503,15 +501,11 @@ impl RodioAudioPlayer {
 
          transitions::set_playback_rate(&mut inner.state, rate)?;
 
-         if !playback_rate_change_requires_reopen(
-            previous_playback_rate,
-            inner.state.playback_rate,
-         ) {
+         if !playback_rate_change_requires_reopen(previous_playback_rate, inner.state.playback_rate)
+         {
             PlaybackRateAction::Complete(inner.state.clone())
-         } else if let Some(source_descriptor) = inner
-            .playback
-            .as_ref()
-            .map(|ctx| ctx.source.clone())
+         } else if let Some(source_descriptor) =
+            inner.playback.as_ref().map(|ctx| ctx.source.clone())
          {
             inner.seek_generation = inner.seek_generation.wrapping_add(1);
             let seek_generation = inner.seek_generation;
@@ -707,10 +701,7 @@ fn restore_reopen_failure_state(
    }
 }
 
-fn playback_rate_change_requires_reopen(
-   previous_playback_rate: f64,
-   playback_rate: f64,
-) -> bool {
+fn playback_rate_change_requires_reopen(previous_playback_rate: f64, playback_rate: f64) -> bool {
    previous_playback_rate != playback_rate
 }
 
