@@ -184,9 +184,10 @@ impl PlaybackStream {
       outputs: &mut [&mut [f32]],
       output_samples: usize,
    ) -> Result<usize, PlaybackStreamError> {
-      let input_samples = self.advance_timing(output_samples);
+      let input_samples = self.input_samples_for_output(output_samples);
       validate_inputs(inputs, self.channels, input_samples)?;
       validate_outputs(outputs, self.channels, output_samples)?;
+      let input_samples = self.advance_timing(output_samples);
       self
          .stretch
          .process(inputs, input_samples, outputs, output_samples);
@@ -388,10 +389,9 @@ fn validate_playback_rate(playback_rate: f32) -> Result<(), PlaybackStreamError>
 
 fn interleaved_len(samples: usize, channels: usize) -> Result<usize, PlaybackStreamError> {
    validate_channels(channels)?;
-   samples.checked_mul(channels).ok_or(PlaybackStreamError::InterleavedLengthOverflow {
-      samples,
-      channels,
-   })
+   samples
+      .checked_mul(channels)
+      .ok_or(PlaybackStreamError::InterleavedLengthOverflow { samples, channels })
 }
 
 fn validate_inputs(
