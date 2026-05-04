@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use rodio::{Sample, Source};
 use signalsmith::PlaybackStream;
+use tracing::warn;
+
+use crate::error::{Error, Result};
 
 const OUTPUT_BLOCK_FRAMES: usize = 512;
 const FLUSH_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 4;
@@ -23,7 +26,10 @@ pub(crate) struct StretchSource {
 }
 
 impl StretchSource {
-   pub(crate) fn new(input: Box<dyn Source<Item = Sample> + Send>, playback_rate: f64) -> Self {
+   pub(crate) fn new(
+      input: Box<dyn Source<Item = Sample> + Send>,
+      playback_rate: f64,
+   ) -> Result<Self> {
       let channels = input.channels();
       let sample_rate = input.sample_rate();
       let total_duration = input.total_duration();
@@ -31,10 +37,11 @@ impl StretchSource {
          channels.get() as usize,
          sample_rate.get() as f32,
          playback_rate as f32,
-      );
+      )
+      .map_err(|error| Error::Audio(format!("Failed to initialize playback stretcher: {error}")))?;
       let flush_frames = FLUSH_FRAMES.max(stream.output_latency().max(1));
 
-      Self {
+      Ok(Self {
          input,
          stream,
          channels,
@@ -47,7 +54,7 @@ impl StretchSource {
          output_index: 0,
          flushed: false,
          ended: false,
-      }
+      })
    }
 
    fn channel_count(&self) -> usize {
@@ -89,7 +96,11 @@ impl StretchSource {
       self
          .output_buffer
          .resize(self.flush_frames * self.channel_count(), 0.0);
-      self.stream.flush_interleaved(&mut self.output_buffer);
+      if let Err(error) = self.stream.flush_interleaved(&mut self.output_buffer) {
+         warn!("Stopping stretched playback during flush: {error}");
+         self.output_buffer.clear();
+         return false;
+      }
       self.flushed = true;
 
       !self.output_buffer.is_empty()
@@ -143,6 +154,15 @@ impl StretchSource {
       let consumed = self
          .stream
          .process_interleaved(&self.input_buffer, &mut self.output_buffer);
+
+      let consumed = match consumed {
+         Ok(consumed) => consumed,
+         Err(error) => {
+            warn!("Stopping stretched playback during processing: {error}");
+            self.output_buffer.clear();
+            return false;
+         }
+      };
 
       debug_assert_eq!(consumed, input_frames);
 

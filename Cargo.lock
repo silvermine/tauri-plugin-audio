@@ -3324,6 +3324,7 @@ name = "signalsmith"
 version = "0.1.0"
 dependencies = [
  "rodio",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

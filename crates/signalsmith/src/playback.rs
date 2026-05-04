@@ -1,5 +1,54 @@
 use crate::port::Stretch;
 
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum PlaybackStreamError {
+   #[error("playback_rate must be finite and non-negative, got {0}")]
+   InvalidPlaybackRate(f32),
+
+   #[error(
+      "input channel count {actual_channels} must match configured channel count {expected_channels}"
+   )]
+   InvalidInputChannelCount {
+      actual_channels: usize,
+      expected_channels: usize,
+   },
+
+   #[error(
+      "output channel count {actual_channels} must match configured channel count {expected_channels}"
+   )]
+   InvalidOutputChannelCount {
+      actual_channels: usize,
+      expected_channels: usize,
+   },
+
+   #[error(
+      "input channel {channel_index} length {channel_len} shorter than required {required_len}"
+   )]
+   InputChannelTooShort {
+      channel_index: usize,
+      channel_len: usize,
+      required_len: usize,
+   },
+
+   #[error(
+      "output channel {channel_index} length {channel_len} shorter than required {required_len}"
+   )]
+   OutputChannelTooShort {
+      channel_index: usize,
+      channel_len: usize,
+      required_len: usize,
+   },
+
+   #[error("interleaved output length {output_len} must be divisible by channel count {channels}")]
+   InvalidInterleavedOutputLength { output_len: usize, channels: usize },
+
+   #[error("interleaved input length {input_len} shorter than required {required_len}")]
+   InputTooShort {
+      input_len: usize,
+      required_len: usize,
+   },
+}
+
 /// Streaming-first playback helper around the Signalsmith-style `Stretch` port.
 ///
 /// The source-tracking port still expresses speed exactly like upstream
@@ -21,12 +70,16 @@ pub struct PlaybackStream {
 pub type PlaybackRateController = PlaybackStream;
 
 impl PlaybackStream {
-   pub fn new(channels: usize, sample_rate: f32) -> Self {
+   pub fn new(channels: usize, sample_rate: f32) -> Result<Self, PlaybackStreamError> {
       Self::with_rate(channels, sample_rate, 1.0)
    }
 
-   pub fn with_rate(channels: usize, sample_rate: f32, playback_rate: f32) -> Self {
-      validate_playback_rate(playback_rate);
+   pub fn with_rate(
+      channels: usize,
+      sample_rate: f32,
+      playback_rate: f32,
+   ) -> Result<Self, PlaybackStreamError> {
+      validate_playback_rate(playback_rate)?;
       let mut stretch = Stretch::new();
       // Streaming-first default: upstream recommends split computation for
       // stricter real-time situations. The source-tracking `Stretch` API
@@ -41,24 +94,24 @@ impl PlaybackStream {
       interval_samples: usize,
       split_computation: bool,
       playback_rate: f32,
-   ) -> Self {
-      validate_playback_rate(playback_rate);
+   ) -> Result<Self, PlaybackStreamError> {
+      validate_playback_rate(playback_rate)?;
       let mut stretch = Stretch::new();
       stretch.configure(channels, block_samples, interval_samples, split_computation);
       Self::from_stretch(stretch, playback_rate)
    }
 
-   pub fn from_stretch(stretch: Stretch, playback_rate: f32) -> Self {
-      validate_playback_rate(playback_rate);
+   pub fn from_stretch(stretch: Stretch, playback_rate: f32) -> Result<Self, PlaybackStreamError> {
+      validate_playback_rate(playback_rate)?;
       let channels = stretch.channels();
-      Self {
+      Ok(Self {
          stretch,
          playback_rate,
          input_remainder: 0.0,
          channels,
          input_scratch: vec![Vec::new(); channels],
          output_scratch: vec![Vec::new(); channels],
-      }
+      })
    }
 
    pub fn stretch(&self) -> &Stretch {
@@ -77,9 +130,10 @@ impl PlaybackStream {
       self.playback_rate
    }
 
-   pub fn set_playback_rate(&mut self, playback_rate: f32) {
-      validate_playback_rate(playback_rate);
+   pub fn set_playback_rate(&mut self, playback_rate: f32) -> Result<(), PlaybackStreamError> {
+      validate_playback_rate(playback_rate)?;
       self.playback_rate = playback_rate;
+      Ok(())
    }
 
    pub fn reset(&mut self) {
@@ -116,16 +170,22 @@ impl PlaybackStream {
       inputs: &[&[f32]],
       outputs: &mut [&mut [f32]],
       output_samples: usize,
-   ) -> usize {
+   ) -> Result<usize, PlaybackStreamError> {
       let input_samples = self.advance_timing(output_samples);
+      validate_inputs(inputs, self.channels, input_samples)?;
+      validate_outputs(outputs, self.channels, output_samples)?;
       self
          .stretch
          .process(inputs, input_samples, outputs, output_samples);
-      input_samples
+      Ok(input_samples)
    }
 
    /// Process a full output buffer, using the first output channel length.
-   pub fn process_buffer(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) -> usize {
+   pub fn process_buffer(
+      &mut self,
+      inputs: &[&[f32]],
+      outputs: &mut [&mut [f32]],
+   ) -> Result<usize, PlaybackStreamError> {
       let output_samples = outputs.first().map_or(0, |output| output.len());
       self.process(inputs, outputs, output_samples)
    }
@@ -135,18 +195,15 @@ impl PlaybackStream {
    /// This mirrors the public layout used by `signalsmith-stretch-rs`, while
    /// keeping the pure port internally channel-major. Scratch buffers are kept
    /// on the stream and reused across calls.
-   pub fn process_interleaved(&mut self, input: &[f32], output: &mut [f32]) -> usize {
-      assert_eq!(
-         output.len() % self.channels,
-         0,
-         "interleaved output length must be divisible by channel count"
-      );
+   pub fn process_interleaved(
+      &mut self,
+      input: &[f32],
+      output: &mut [f32],
+   ) -> Result<usize, PlaybackStreamError> {
+      validate_interleaved_output(output.len(), self.channels)?;
       let output_samples = output.len() / self.channels;
       let input_samples = self.input_samples_for_output(output_samples);
-      assert!(
-         input.len() >= input_samples * self.channels,
-         "interleaved input shorter than required input frames"
-      );
+      validate_interleaved_input(input.len(), input_samples * self.channels)?;
 
       self.prepare_interleaved_input(input, input_samples);
       self.prepare_output_scratch(output_samples);
@@ -164,24 +221,32 @@ impl PlaybackStream {
             output[frame * self.channels + channel] = self.output_scratch[channel][frame];
          }
       }
-      consumed
+      Ok(consumed)
    }
 
-   pub fn seek(&mut self, inputs: &[&[f32]], input_samples: usize) {
+   pub fn seek(
+      &mut self,
+      inputs: &[&[f32]],
+      input_samples: usize,
+   ) -> Result<(), PlaybackStreamError> {
+      validate_inputs(inputs, self.channels, input_samples)?;
       self.stretch.seek(inputs, input_samples, self.playback_rate);
       self.reset_timing();
+      Ok(())
    }
 
-   pub fn seek_interleaved(&mut self, input: &[f32], input_samples: usize) {
-      assert!(
-         input.len() >= input_samples * self.channels,
-         "interleaved input shorter than input_samples"
-      );
+   pub fn seek_interleaved(
+      &mut self,
+      input: &[f32],
+      input_samples: usize,
+   ) -> Result<(), PlaybackStreamError> {
+      validate_interleaved_input(input.len(), input_samples * self.channels)?;
       self.prepare_interleaved_input(input, input_samples);
       self
          .stretch
          .seek_vecs(&self.input_scratch, input_samples, self.playback_rate);
       self.reset_timing();
+      Ok(())
    }
 
    pub fn seek_length(&self) -> usize {
@@ -196,45 +261,45 @@ impl PlaybackStream {
    ///
    /// Returns the number of input samples required by the seek. Input channel
    /// slices must contain at least this many samples.
-   pub fn output_seek(&mut self, inputs: &[&[f32]]) -> usize {
+   pub fn output_seek(&mut self, inputs: &[&[f32]]) -> Result<usize, PlaybackStreamError> {
       let input_length = self.output_seek_length();
+      validate_inputs(inputs, self.channels, input_length)?;
       self.stretch.output_seek(inputs, input_length);
       self.reset_timing();
-      input_length
+      Ok(input_length)
    }
 
-   pub fn output_seek_interleaved(&mut self, input: &[f32]) -> usize {
+   pub fn output_seek_interleaved(&mut self, input: &[f32]) -> Result<usize, PlaybackStreamError> {
       let input_length = self.output_seek_length();
-      assert!(
-         input.len() >= input_length * self.channels,
-         "interleaved input shorter than output seek length"
-      );
+      validate_interleaved_input(input.len(), input_length * self.channels)?;
       self.prepare_interleaved_input(input, input_length);
       self
          .stretch
          .output_seek_vecs(&self.input_scratch, input_length);
       self.reset_timing();
-      input_length
+      Ok(input_length)
    }
 
-   pub fn flush(&mut self, outputs: &mut [&mut [f32]], output_samples: usize) {
+   pub fn flush(
+      &mut self,
+      outputs: &mut [&mut [f32]],
+      output_samples: usize,
+   ) -> Result<(), PlaybackStreamError> {
+      validate_outputs(outputs, self.channels, output_samples)?;
       self
          .stretch
          .flush(outputs, output_samples, self.playback_rate);
       self.reset_timing();
+      Ok(())
    }
 
-   pub fn flush_buffer(&mut self, outputs: &mut [&mut [f32]]) {
+   pub fn flush_buffer(&mut self, outputs: &mut [&mut [f32]]) -> Result<(), PlaybackStreamError> {
       let output_samples = outputs.first().map_or(0, |output| output.len());
-      self.flush(outputs, output_samples);
+      self.flush(outputs, output_samples)
    }
 
-   pub fn flush_interleaved(&mut self, output: &mut [f32]) {
-      assert_eq!(
-         output.len() % self.channels,
-         0,
-         "interleaved output length must be divisible by channel count"
-      );
+   pub fn flush_interleaved(&mut self, output: &mut [f32]) -> Result<(), PlaybackStreamError> {
+      validate_interleaved_output(output.len(), self.channels)?;
       let output_samples = output.len() / self.channels;
       self.prepare_output_scratch(output_samples);
       self
@@ -246,6 +311,7 @@ impl PlaybackStream {
             output[frame * self.channels + channel] = self.output_scratch[channel][frame];
          }
       }
+      Ok(())
    }
 
    fn advance_timing(&mut self, output_samples: usize) -> usize {
@@ -283,11 +349,90 @@ impl PlaybackStream {
    }
 }
 
-fn validate_playback_rate(playback_rate: f32) {
-   assert!(
-      playback_rate.is_finite() && playback_rate >= 0.0,
-      "playback_rate must be finite and non-negative"
-   );
+fn validate_playback_rate(playback_rate: f32) -> Result<(), PlaybackStreamError> {
+   if playback_rate.is_finite() && playback_rate >= 0.0 {
+      Ok(())
+   } else {
+      Err(PlaybackStreamError::InvalidPlaybackRate(playback_rate))
+   }
+}
+
+fn validate_inputs(
+   inputs: &[&[f32]],
+   expected_channels: usize,
+   required_len: usize,
+) -> Result<(), PlaybackStreamError> {
+   if inputs.len() != expected_channels {
+      return Err(PlaybackStreamError::InvalidInputChannelCount {
+         actual_channels: inputs.len(),
+         expected_channels,
+      });
+   }
+
+   for (channel_index, channel) in inputs.iter().enumerate() {
+      if channel.len() < required_len {
+         return Err(PlaybackStreamError::InputChannelTooShort {
+            channel_index,
+            channel_len: channel.len(),
+            required_len,
+         });
+      }
+   }
+
+   Ok(())
+}
+
+fn validate_outputs(
+   outputs: &[&mut [f32]],
+   expected_channels: usize,
+   required_len: usize,
+) -> Result<(), PlaybackStreamError> {
+   if outputs.len() != expected_channels {
+      return Err(PlaybackStreamError::InvalidOutputChannelCount {
+         actual_channels: outputs.len(),
+         expected_channels,
+      });
+   }
+
+   for (channel_index, channel) in outputs.iter().enumerate() {
+      if channel.len() < required_len {
+         return Err(PlaybackStreamError::OutputChannelTooShort {
+            channel_index,
+            channel_len: channel.len(),
+            required_len,
+         });
+      }
+   }
+
+   Ok(())
+}
+
+fn validate_interleaved_output(
+   output_len: usize,
+   channels: usize,
+) -> Result<(), PlaybackStreamError> {
+   if output_len % channels == 0 {
+      Ok(())
+   } else {
+      Err(PlaybackStreamError::InvalidInterleavedOutputLength {
+         output_len,
+         channels,
+      })
+   }
+}
+
+fn validate_interleaved_input(
+   input_len: usize,
+   required_len: usize,
+) -> Result<(), PlaybackStreamError> {
+   if input_len >= required_len {
+      Ok(())
+   } else {
+      Err(PlaybackStreamError::InputTooShort {
+         input_len,
+         required_len,
+      })
+   }
 }
 
 #[cfg(test)]
@@ -298,7 +443,7 @@ mod tests {
 
    #[test]
    fn playback_stream_averages_fractional_blocks() {
-      let mut stream = PlaybackStream::configured(1, 128, 32, false, 1.1);
+      let mut stream = PlaybackStream::configured(1, 128, 32, false, 1.1).unwrap();
       let mut total = 0;
 
       for _ in 0..10 {
@@ -308,41 +453,23 @@ mod tests {
          let mut output = vec![0.0_f32; output_samples];
          let inputs = [&input[..]];
          let mut outputs = [&mut output[..]];
-         total += stream.process(&inputs, &mut outputs, output_samples);
+         total += stream
+            .process(&inputs, &mut outputs, output_samples)
+            .unwrap();
       }
 
       assert_eq!(total, 1408);
 
-      stream.set_playback_rate(0.75);
+      stream.set_playback_rate(0.75).unwrap();
       stream.reset_timing();
       assert_eq!(stream.input_samples_for_output(128), 96);
       assert_eq!(stream.playback_rate(), 0.75);
    }
 
    #[test]
-   fn playback_stream_processes_fixed_output_blocks() {
-      let mut stream = PlaybackStream::configured(1, 256, 64, false, 1.25);
-
-      let output_samples = 512;
-      let input_samples = stream.input_samples_for_output(output_samples);
-      assert_eq!(input_samples, 640);
-
-      let input: Vec<f32> = (0..input_samples)
-         .map(|i| (2.0 * PI * 440.0 * i as f32 / 48_000.0).sin() * 0.25)
-         .collect();
-      let mut output = vec![0.0_f32; output_samples];
-      let inputs = [&input[..]];
-      let mut outputs = [&mut output[..]];
-
-      let consumed = stream.process(&inputs, &mut outputs, output_samples);
-      assert_eq!(consumed, input_samples);
-      assert!(output.iter().all(|v| v.is_finite()));
-   }
-
-   #[test]
    fn interleaved_processing_matches_channel_major_path() {
-      let mut stream = PlaybackStream::configured(2, 256, 64, false, 1.25);
-      let mut reference = PlaybackStream::configured(2, 256, 64, false, 1.25);
+      let mut stream = PlaybackStream::configured(2, 256, 64, false, 1.25).unwrap();
+      let mut reference = PlaybackStream::configured(2, 256, 64, false, 1.25).unwrap();
 
       let output_samples = 512;
       let input_samples = stream.input_samples_for_output(output_samples);
@@ -357,7 +484,9 @@ mod tests {
       }
 
       let mut interleaved_output = vec![0.0_f32; output_samples * 2];
-      let consumed = stream.process_interleaved(&interleaved_input, &mut interleaved_output);
+      let consumed = stream
+         .process_interleaved(&interleaved_input, &mut interleaved_output)
+         .unwrap();
       assert_eq!(consumed, input_samples);
 
       let mut out_left = vec![0.0_f32; output_samples];
@@ -365,7 +494,9 @@ mod tests {
       let inputs = [&left[..], &right[..]];
       let mut outputs = [&mut out_left[..], &mut out_right[..]];
       assert_eq!(
-         reference.process(&inputs, &mut outputs, output_samples),
+         reference
+            .process(&inputs, &mut outputs, output_samples)
+            .unwrap(),
          input_samples
       );
 
@@ -376,16 +507,112 @@ mod tests {
    }
 
    #[test]
-   fn playback_stream_output_seek_uses_current_rate() {
-      let mut stream = PlaybackStream::configured(1, 256, 64, false, 0.75);
-      let input_length = stream.output_seek_length();
-      assert_eq!(input_length, 224);
+   fn playback_stream_output_seek_tracks_updated_rate() {
+      let mut stream = PlaybackStream::configured(1, 256, 64, false, 1.0).unwrap();
+      let initial_input_length = stream.output_seek_length();
 
-      let input: Vec<f32> = (0..input_length)
+      stream.set_playback_rate(0.75).unwrap();
+      let updated_input_length = stream.output_seek_length();
+
+      assert_eq!(stream.playback_rate(), 0.75);
+      assert_eq!(
+         initial_input_length,
+         stream.input_latency() + stream.output_latency(),
+      );
+      assert_eq!(
+         updated_input_length,
+         stream.input_latency() + (0.75 * stream.output_latency() as f32) as usize,
+      );
+      assert!(updated_input_length < initial_input_length);
+
+      let input: Vec<f32> = (0..updated_input_length)
          .map(|i| (2.0 * PI * 220.0 * i as f32 / 48_000.0).sin() * 0.2)
          .collect();
       let inputs = [&input[..]];
 
-      assert_eq!(stream.output_seek(&inputs), input_length);
+      assert_eq!(stream.output_seek(&inputs).unwrap(), updated_input_length);
+   }
+
+   #[test]
+   fn process_interleaved_rejects_non_divisible_output_length() {
+      let mut stream = PlaybackStream::configured(2, 256, 64, false, 1.0).unwrap();
+      let input = vec![0.0_f32; 8];
+      let mut output = vec![0.0_f32; 3];
+
+      let result = stream.process_interleaved(&input, &mut output);
+
+      assert_eq!(
+         result,
+         Err(PlaybackStreamError::InvalidInterleavedOutputLength {
+            output_len: 3,
+            channels: 2,
+         })
+      );
+   }
+
+   #[test]
+   fn process_interleaved_rejects_short_input() {
+      let mut stream = PlaybackStream::configured(1, 256, 64, false, 1.25).unwrap();
+      let mut output = vec![0.0_f32; 16];
+      let input = vec![0.0_f32; 1];
+
+      let result = stream.process_interleaved(&input, &mut output);
+
+      assert_eq!(
+         result,
+         Err(PlaybackStreamError::InputTooShort {
+            input_len: 1,
+            required_len: stream.input_samples_for_output(16),
+         })
+      );
+   }
+
+   #[test]
+   fn with_rate_rejects_invalid_playback_rate() {
+      let result = PlaybackStream::with_rate(1, 48_000.0, f32::NAN);
+
+      assert!(matches!(
+         result,
+         Err(PlaybackStreamError::InvalidPlaybackRate(value)) if value.is_nan()
+      ));
+   }
+
+   #[test]
+   fn process_rejects_wrong_input_channel_count() {
+      let mut stream = PlaybackStream::configured(2, 256, 64, false, 1.0).unwrap();
+      let left = [0.0_f32; 16];
+      let mut out_left = [0.0_f32; 8];
+      let mut out_right = [0.0_f32; 8];
+      let inputs = [&left[..]];
+      let mut outputs = [&mut out_left[..], &mut out_right[..]];
+
+      let result = stream.process(&inputs, &mut outputs, 8);
+
+      assert_eq!(
+         result,
+         Err(PlaybackStreamError::InvalidInputChannelCount {
+            actual_channels: 1,
+            expected_channels: 2,
+         })
+      );
+   }
+
+   #[test]
+   fn flush_rejects_short_output_channel() {
+      let mut stream = PlaybackStream::configured(2, 256, 64, false, 1.0).unwrap();
+      let mut out_left = [0.0_f32; 8];
+      let mut out_right = [0.0_f32; 7];
+      let mut outputs = [&mut out_left[..], &mut out_right[..]];
+
+      let result = stream.flush(&mut outputs, 8);
+
+      assert_eq!(
+         result,
+         Err(PlaybackStreamError::OutputChannelTooShort {
+            channel_index: 1,
+            channel_len: 7,
+            required_len: 8,
+         })
+      );
    }
 }

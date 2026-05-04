@@ -17,5 +17,5 @@
 mod playback;
 mod port;
 
-pub use playback::{PlaybackRateController, PlaybackStream};
+pub use playback::{PlaybackRateController, PlaybackStream, PlaybackStreamError};
 pub use port::Stretch;

@@ -17,7 +17,7 @@ use signalsmith::PlaybackStream;
 const SOURCE_DURATION_SECONDS: usize = 5;
 const OUTPUT_BLOCK_FRAMES: usize = 512;
 const FLUSH_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 4;
-const SEEK_FADE_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 20;
+const SEEK_FADE_FRAMES: usize = OUTPUT_BLOCK_FRAMES * 10;
 
 type BoxedSource = Box<dyn Source<Item = f32> + Send>;
 type FixtureDecoder = (BoxedSource, NonZeroU16, NonZeroU32, Option<Duration>);
@@ -200,7 +200,8 @@ impl StreamingPlaybackSource {
          usize::from(channels.get()),
          sample_rate_hz.get() as f32,
          playback_rate,
-      );
+      )
+      .unwrap();
 
       Self {
          input,
@@ -265,7 +266,10 @@ impl StreamingPlaybackSource {
 
       let seek_input_frames = self.stream.output_seek_length();
       self.read_exact_input_frames(seek_input_frames, "seek warmup");
-      self.stream.output_seek_interleaved(&self.input_buffer);
+      self
+         .stream
+         .output_seek_interleaved(&self.input_buffer)
+         .unwrap();
       self.input_buffer.clear();
 
       Ok(())
@@ -353,7 +357,10 @@ impl StreamingPlaybackSource {
       self
          .output_buffer
          .resize(FLUSH_FRAMES * self.channel_count(), 0.0);
-      self.stream.flush_interleaved(&mut self.output_buffer);
+      self
+         .stream
+         .flush_interleaved(&mut self.output_buffer)
+         .unwrap();
       self.flushed = true;
 
       !self.output_buffer.is_empty()
@@ -386,7 +393,8 @@ impl StreamingPlaybackSource {
 
       let consumed = self
          .stream
-         .process_interleaved(&self.input_buffer, &mut self.output_buffer);
+         .process_interleaved(&self.input_buffer, &mut self.output_buffer)
+         .unwrap();
 
       assert_eq!(consumed, input_frames);
       true
