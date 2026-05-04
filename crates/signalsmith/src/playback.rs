@@ -5,6 +5,12 @@ pub enum PlaybackStreamError {
    #[error("playback_rate must be finite and non-negative, got {0}")]
    InvalidPlaybackRate(f32),
 
+   #[error("channel count must be greater than zero, got {channels}")]
+   InvalidChannelCount { channels: usize },
+
+   #[error("sample_rate must be finite and greater than zero, got {sample_rate}")]
+   InvalidSampleRate { sample_rate: f32 },
+
    #[error(
       "input channel count {actual_channels} must match configured channel count {expected_channels}"
    )]
@@ -12,6 +18,9 @@ pub enum PlaybackStreamError {
       actual_channels: usize,
       expected_channels: usize,
    },
+
+   #[error("sample count {samples} with channel count {channels} overflows interleaved length")]
+   InterleavedLengthOverflow { samples: usize, channels: usize },
 
    #[error(
       "output channel count {actual_channels} must match configured channel count {expected_channels}"
@@ -79,6 +88,8 @@ impl PlaybackStream {
       sample_rate: f32,
       playback_rate: f32,
    ) -> Result<Self, PlaybackStreamError> {
+      validate_channels(channels)?;
+      validate_sample_rate(sample_rate)?;
       validate_playback_rate(playback_rate)?;
       let mut stretch = Stretch::new();
       // Streaming-first default: upstream recommends split computation for
@@ -95,6 +106,7 @@ impl PlaybackStream {
       split_computation: bool,
       playback_rate: f32,
    ) -> Result<Self, PlaybackStreamError> {
+      validate_channels(channels)?;
       validate_playback_rate(playback_rate)?;
       let mut stretch = Stretch::new();
       stretch.configure(channels, block_samples, interval_samples, split_computation);
@@ -104,6 +116,7 @@ impl PlaybackStream {
    pub fn from_stretch(stretch: Stretch, playback_rate: f32) -> Result<Self, PlaybackStreamError> {
       validate_playback_rate(playback_rate)?;
       let channels = stretch.channels();
+      validate_channels(channels)?;
       Ok(Self {
          stretch,
          playback_rate,
@@ -203,7 +216,7 @@ impl PlaybackStream {
       validate_interleaved_output(output.len(), self.channels)?;
       let output_samples = output.len() / self.channels;
       let input_samples = self.input_samples_for_output(output_samples);
-      validate_interleaved_input(input.len(), input_samples * self.channels)?;
+      validate_interleaved_input(input.len(), interleaved_len(input_samples, self.channels)?)?;
 
       self.prepare_interleaved_input(input, input_samples);
       self.prepare_output_scratch(output_samples);
@@ -240,7 +253,7 @@ impl PlaybackStream {
       input: &[f32],
       input_samples: usize,
    ) -> Result<(), PlaybackStreamError> {
-      validate_interleaved_input(input.len(), input_samples * self.channels)?;
+      validate_interleaved_input(input.len(), interleaved_len(input_samples, self.channels)?)?;
       self.prepare_interleaved_input(input, input_samples);
       self
          .stretch
@@ -271,7 +284,7 @@ impl PlaybackStream {
 
    pub fn output_seek_interleaved(&mut self, input: &[f32]) -> Result<usize, PlaybackStreamError> {
       let input_length = self.output_seek_length();
-      validate_interleaved_input(input.len(), input_length * self.channels)?;
+      validate_interleaved_input(input.len(), interleaved_len(input_length, self.channels)?)?;
       self.prepare_interleaved_input(input, input_length);
       self
          .stretch
@@ -349,12 +362,36 @@ impl PlaybackStream {
    }
 }
 
+fn validate_channels(channels: usize) -> Result<(), PlaybackStreamError> {
+   if channels > 0 {
+      Ok(())
+   } else {
+      Err(PlaybackStreamError::InvalidChannelCount { channels })
+   }
+}
+
+fn validate_sample_rate(sample_rate: f32) -> Result<(), PlaybackStreamError> {
+   if sample_rate.is_finite() && sample_rate > 0.0 {
+      Ok(())
+   } else {
+      Err(PlaybackStreamError::InvalidSampleRate { sample_rate })
+   }
+}
+
 fn validate_playback_rate(playback_rate: f32) -> Result<(), PlaybackStreamError> {
    if playback_rate.is_finite() && playback_rate >= 0.0 {
       Ok(())
    } else {
       Err(PlaybackStreamError::InvalidPlaybackRate(playback_rate))
    }
+}
+
+fn interleaved_len(samples: usize, channels: usize) -> Result<usize, PlaybackStreamError> {
+   validate_channels(channels)?;
+   samples.checked_mul(channels).ok_or(PlaybackStreamError::InterleavedLengthOverflow {
+      samples,
+      channels,
+   })
 }
 
 fn validate_inputs(
@@ -411,6 +448,7 @@ fn validate_interleaved_output(
    output_len: usize,
    channels: usize,
 ) -> Result<(), PlaybackStreamError> {
+   validate_channels(channels)?;
    if output_len % channels == 0 {
       Ok(())
    } else {
