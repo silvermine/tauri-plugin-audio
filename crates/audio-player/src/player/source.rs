@@ -101,6 +101,7 @@ fn open_local_source(path: &Path, start_time: Duration) -> Result<BoxedSource> {
       Some(byte_len),
       hint.as_deref(),
       None,
+      false,
       start_time,
    )?;
 
@@ -116,6 +117,7 @@ fn open_remote_source(
       remote.byte_len,
       remote.hint.as_deref(),
       remote.mime_type.as_deref(),
+      true,
       start_time,
    )?;
 
@@ -127,6 +129,7 @@ fn build_decoder<R>(
    byte_len: Option<u64>,
    hint: Option<&str>,
    mime_type: Option<&str>,
+   coarse_seek: bool,
    start_time: Duration,
 ) -> Result<Decoder<R>>
 where
@@ -134,6 +137,7 @@ where
 {
    let mut builder = Decoder::builder()
       .with_data(reader)
+      .with_coarse_seek(coarse_seek)
       .with_gapless(true)
       .with_seekable(true);
 
