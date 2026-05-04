@@ -122,23 +122,24 @@ impl RodioAudioPlayer {
 
         let result = self.load_inner(src, &meta, load_generation, playback_rate);
 
-         match result {
+        match result {
             Ok(snapshot) => {
-               (self.on_changed)(&snapshot);
-               Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ready))
+                (self.on_changed)(&snapshot);
+                Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ready))
             }
             Err(error) => {
-               let snapshot = {
-                  let mut inner = lock_inner(&self.inner);
-                  transitions::error(&mut inner.state, error.to_string());
-                  inner.playback = None;
-                  inner.state.clone()
-               };
+                let snapshot = {
+                    let mut inner = lock_inner(&self.inner);
+                    finish_load_as_error(&mut inner, load_generation, error.to_string())
+                };
 
-               (self.on_changed)(&snapshot);
-               Err(error)
+                if let Some(snapshot) = snapshot {
+                    (self.on_changed)(&snapshot);
+                }
+
+                Err(error)
             }
-         }
+        }
     }
 
     fn load_inner(
@@ -563,6 +564,21 @@ fn finish_playback_as_ended(inner: &mut Inner, duration: f64, position: f64) -> 
    inner.state.status = PlaybackStatus::Ended;
    inner.state.current_time = if duration > 0.0 { duration } else { position };
    inner.state.clone()
+}
+
+fn finish_load_as_error(
+   inner: &mut Inner,
+   load_generation: u64,
+   message: String,
+) -> Option<PlayerState> {
+   if inner.load_generation != load_generation || inner.state.status != PlaybackStatus::Loading {
+      return None;
+   }
+
+   transitions::error(&mut inner.state, message);
+   inner.playback = None;
+
+   Some(inner.state.clone())
 }
 
 // ---------------------------------------------------------------------------
