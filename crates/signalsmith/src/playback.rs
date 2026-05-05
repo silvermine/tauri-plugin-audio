@@ -17,9 +17,7 @@ pub enum PlaybackStreamError {
       minimum_block_samples: usize,
    },
 
-   #[error(
-      "interval_samples must be at least {minimum_interval_samples}, got {interval_samples}"
-   )]
+   #[error("interval_samples must be at least {minimum_interval_samples}, got {interval_samples}")]
    InvalidIntervalSamples {
       interval_samples: usize,
       minimum_interval_samples: usize,
@@ -381,7 +379,6 @@ impl PlaybackStream {
          channel.resize(output_samples, 0.0);
       }
    }
-
 }
 
 fn validate_channels(channels: usize) -> Result<(), PlaybackStreamError> {
@@ -409,10 +406,7 @@ fn validate_playback_rate(playback_rate: f32) -> Result<(), PlaybackStreamError>
 }
 
 fn preset_default_sizes(sample_rate: f32) -> (usize, usize) {
-   (
-      (sample_rate * 0.12) as usize,
-      (sample_rate * 0.03) as usize,
-   )
+   ((sample_rate * 0.12) as usize, (sample_rate * 0.03) as usize)
 }
 
 fn validate_stretch_configuration(

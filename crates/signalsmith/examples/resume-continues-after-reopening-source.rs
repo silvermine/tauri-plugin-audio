@@ -19,13 +19,12 @@ fn main() -> common::ExampleResult {
    );
    fixture.assert_length(source_frames, "resume preview length");
 
-   common::fixture::play_streaming_audio(
-      fixture.into_streaming_source(playback_rate, seek_frame),
-   )?;
+   common::fixture::play_streaming_audio(fixture.into_streaming_source(playback_rate, seek_frame))?;
 
    thread::sleep(Duration::from_secs(paused_seconds as u64));
 
-   let second_source = common::open_seeked_fixture_source(playback_rate, seek_frame, source_frames)?;
+   let second_source =
+      common::open_seeked_fixture_source(playback_rate, seek_frame, source_frames)?;
 
    // clicks
    common::fixture::play_streaming_audio(second_source)

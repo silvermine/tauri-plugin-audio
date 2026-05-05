@@ -6,8 +6,8 @@ use std::time::Duration;
 use rodio::stream::MixerDeviceSink;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 
-use super::streaming_source::StreamingPlaybackSource;
 use super::ExampleResult;
+use super::streaming_source::StreamingPlaybackSource;
 
 pub(crate) type BoxedSource = Box<dyn Source<Item = f32> + Send>;
 type FixtureDecoder = (BoxedSource, NonZeroU16, NonZeroU32, Option<Duration>);
@@ -46,7 +46,9 @@ impl FixtureSource {
    pub(crate) fn available_frames_or_preview(&self) -> usize {
       self
          .total_duration
-         .map(|duration| (duration.as_secs_f64() * self.sample_rate_hz.get() as f64).floor() as usize)
+         .map(|duration| {
+            (duration.as_secs_f64() * self.sample_rate_hz.get() as f64).floor() as usize
+         })
          .unwrap_or(self.preview_frames())
    }
 
@@ -82,7 +84,8 @@ impl FixtureSource {
 
 fn fixture_path() -> PathBuf {
    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-      .join("tests")
+      .join("..")
+      .join("..")
       .join("fixtures")
       .join("music.wav")
 }

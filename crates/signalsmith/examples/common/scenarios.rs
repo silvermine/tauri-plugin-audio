@@ -1,8 +1,5 @@
 use super::ExampleResult;
-use super::fixture::{
-   FixtureSource,
-   play_streaming_audio,
-};
+use super::fixture::{FixtureSource, play_streaming_audio};
 use super::streaming_source::StreamingPlaybackSource;
 
 pub const SOURCE_DURATION_SECONDS: usize = 5;
