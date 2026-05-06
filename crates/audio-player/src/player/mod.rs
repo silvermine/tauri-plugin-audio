@@ -150,6 +150,8 @@ impl RodioAudioPlayer {
       let descriptor = load_source_descriptor(src)?;
 
       let mut playback_rate = lock_inner(&self.inner).state.playback_rate;
+      let mut retry_count = 0;
+      const MAX_RETRIES: u32 = 3;
 
       loop {
          let opened_source = open_source_at(&descriptor, 0.0, playback_rate)?;
@@ -171,6 +173,10 @@ impl RodioAudioPlayer {
          if inner.state.playback_rate != playback_rate {
             playback_rate = inner.state.playback_rate;
             sink.stop();
+            retry_count += 1;
+            if retry_count >= MAX_RETRIES {
+               return Err(Error::InvalidState("Playback rate changed too many times during load".into()));
+            }
             continue;
          }
 
@@ -712,7 +718,7 @@ fn restore_reopen_failure_state(
 }
 
 fn playback_rate_change_requires_reopen(previous_playback_rate: f64, playback_rate: f64) -> bool {
-   previous_playback_rate != playback_rate
+   (playback_rate - previous_playback_rate).abs() > f64::EPSILON
 }
 
 #[cfg(test)]
