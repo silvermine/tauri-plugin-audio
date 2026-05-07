@@ -14,7 +14,7 @@ use crate::models::{AudioMetadata, PlaybackStatus, PlayerState};
 /// Transitions to [`PlaybackStatus::Loading`] and stores metadata.
 ///
 /// Call this before starting I/O so the frontend can show a loading indicator.
-/// After the I/O completes, call [`prepare`] to finalize the transition to `Ready`.
+/// After the I/O completes, call [`load`] to finalize the transition to `Ready`.
 pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> Result<()> {
    match state.status {
       PlaybackStatus::Idle | PlaybackStatus::Ended | PlaybackStatus::Error => {}
@@ -37,8 +37,9 @@ pub fn begin_load(state: &mut PlayerState, src: &str, meta: &AudioMetadata) -> R
    Ok(())
 }
 
-/// Finalizes prepare by transitioning from `Loading` to `Ready` with the
-/// decoded duration.
+/// Finalizes a load by transitioning from `Loading` to `Ready` with the
+/// decoded duration. Also accepts `Idle`, `Ended`, and `Error` in case
+/// `begin_load` was skipped (e.g. instant local file loads).
 pub fn load(state: &mut PlayerState, src: &str, meta: &AudioMetadata, duration: f64) -> Result<()> {
    match state.status {
       PlaybackStatus::Loading => {}
@@ -145,8 +146,8 @@ pub fn seek(state: &mut PlayerState, position: f64) -> Result<()> {
 
 /// Transitions to [`PlaybackStatus::Error`] with a message.
 ///
-/// Valid from `Loading` (I/O or decode failure during prepare). Other statuses are
-/// left unchanged — callers should only invoke this when a prepare operation fails
+/// Valid from `Loading` (I/O or decode failure during load). Other statuses are
+/// left unchanged — callers should only invoke this when a load operation fails
 /// after `begin_load` has already moved the state to `Loading`.
 pub fn error(state: &mut PlayerState, message: String) {
    if state.status == PlaybackStatus::Loading {
@@ -272,7 +273,7 @@ mod tests {
       assert!(begin_load(&mut s, "a.mp3", &AudioMetadata::default()).is_err());
    }
 
-   // -- prepare (finalize) --
+   // -- load (finalize) --
 
    #[test]
    fn load_from_loading() {
