@@ -209,3 +209,93 @@ impl Source for StretchSource {
       self.total_duration
    }
 }
+
+#[cfg(test)]
+mod tests {
+   use rodio::buffer::SamplesBuffer;
+
+   use super::*;
+
+   fn channel_count() -> rodio::ChannelCount {
+      1.try_into().unwrap()
+   }
+
+   fn sample_rate() -> rodio::SampleRate {
+      48_000.try_into().unwrap()
+   }
+
+   fn build_source(
+      samples: Vec<Sample>,
+      channels: rodio::ChannelCount,
+      sample_rate: rodio::SampleRate,
+      playback_rate: f64,
+   ) -> StretchSource {
+      StretchSource::new(
+         Box::new(SamplesBuffer::new(channels, sample_rate, samples)),
+         playback_rate,
+      )
+      .unwrap()
+   }
+
+   #[test]
+   fn read_up_to_input_frames_consumes_pending_samples_before_input() {
+      let mut source = build_source(vec![10.0, 11.0, 12.0], channel_count(), sample_rate(), 1.1);
+      source.pending_input_buffer.extend([1.0, 2.0]);
+
+      assert_eq!(source.read_up_to_input_frames(3), 3);
+      assert_eq!(source.input_buffer, vec![1.0, 2.0, 10.0]);
+      assert!(source.pending_input_buffer.is_empty());
+
+      assert_eq!(source.read_up_to_input_frames(1), 1);
+      assert_eq!(source.input_buffer, vec![11.0]);
+   }
+
+   #[test]
+   fn refill_output_buffer_preserves_unconsumed_input_tail() {
+      let probe = build_source(vec![0.0], channel_count(), sample_rate(), 1.1);
+      let full_block_input_frames = probe.stream.input_samples_for_output(OUTPUT_BLOCK_FRAMES);
+      let available_input_frames = (1..full_block_input_frames)
+         .find(|available_input_frames| {
+            let output_frames = (0..=OUTPUT_BLOCK_FRAMES)
+               .rev()
+               .find(|output_frames| {
+                  probe.stream.input_samples_for_output(*output_frames) <= *available_input_frames
+               })
+               .unwrap();
+
+            probe.stream.input_samples_for_output(output_frames) < *available_input_frames
+         })
+         .unwrap();
+      let samples = (0..available_input_frames)
+         .map(|index| index as Sample)
+         .collect::<Vec<_>>();
+      let mut source = build_source(samples.clone(), channel_count(), sample_rate(), 1.1);
+
+      assert!(source.refill_output_buffer());
+
+      let output_frames = source.output_buffer.len() / source.channel_count();
+      let consumed_input_frames = source.input_buffer.len() / source.channel_count();
+      let pending_samples = source.pending_input_buffer.iter().copied().collect::<Vec<_>>();
+
+      assert!(output_frames < OUTPUT_BLOCK_FRAMES);
+      assert!(consumed_input_frames < available_input_frames);
+      assert_eq!(source.input_buffer, samples[..consumed_input_frames].to_vec());
+      assert_eq!(pending_samples, samples[consumed_input_frames..].to_vec());
+   }
+
+   #[test]
+   fn draining_source_marks_it_ended() {
+      let mut source = build_source(vec![0.25, -0.25, 0.5, -0.5], channel_count(), sample_rate(), 1.1);
+      let mut produced_samples = 0;
+
+      while source.next().is_some() {
+         produced_samples += 1;
+      }
+
+      assert!(produced_samples > 0);
+      assert!(source.flushed);
+      assert!(source.ended);
+      assert_eq!(source.current_span_len(), Some(0));
+      assert_eq!(source.next(), None);
+   }
+}
