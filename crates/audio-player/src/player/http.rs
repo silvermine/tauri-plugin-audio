@@ -12,7 +12,7 @@ use crate::net::reject_private_host;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_MAX_REDIRECTS: usize = 10;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct RemoteSourceDescriptor {
    pub(crate) url: String,
    pub(crate) byte_len: Option<u64>,
@@ -32,21 +32,14 @@ struct HttpResponseReader {
    inner: Box<dyn Read + Send + Sync>,
 }
 
+#[derive(Debug)]
 enum RequestError {
    Ureq(Box<ureq::Error>),
    Http(Error),
 }
 
 pub(crate) fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDescriptor> {
-   let (url, resp) = match descriptor_probe_request(src, true) {
-      Ok(result) => result,
-      Err(RequestError::Ureq(error))
-         if matches!(error.as_ref(), ureq::Error::Status(_, _)) =>
-      {
-         descriptor_probe_request(src, false).map_err(|error| map_request_error(src, error))?
-      }
-      Err(error) => return Err(map_request_error(src, error)),
-   };
+   let (url, resp) = descriptor_probe_request(src, true).map_err(|error| map_request_error(src, error))?;
 
    Ok(RemoteSourceDescriptor {
       url: url.clone(),
@@ -158,10 +151,16 @@ fn stream_http_agent() -> ureq::Agent {
       .build()
 }
 
+struct ContentRange {
+   start: Option<u64>,
+   byte_len: Option<u64>,
+}
+
 fn parse_byte_len(resp: &ureq::Response) -> Option<u64> {
    resp
       .header("content-range")
-      .and_then(parse_content_range_len)
+      .and_then(parse_content_range)
+      .and_then(|content_range| content_range.byte_len)
       .or_else(|| {
          resp
             .header("content-length")
@@ -169,8 +168,64 @@ fn parse_byte_len(resp: &ureq::Response) -> Option<u64> {
       })
 }
 
-fn parse_content_range_len(value: &str) -> Option<u64> {
-   value.rsplit('/').next()?.parse::<u64>().ok()
+fn parse_content_range(value: &str) -> Option<ContentRange> {
+   let (unit, range_and_len) = value.split_once(' ')?;
+
+   if !unit.eq_ignore_ascii_case("bytes") {
+      return None;
+   }
+
+   let (range, byte_len) = range_and_len.split_once('/')?;
+   let byte_len = if byte_len == "*" {
+      None
+   } else {
+      Some(byte_len.parse::<u64>().ok()?)
+   };
+
+   if range == "*" {
+      return Some(ContentRange {
+         start: None,
+         byte_len,
+      });
+   }
+
+   let (start, end) = range.split_once('-')?;
+   let start = start.parse::<u64>().ok()?;
+   let end = end.parse::<u64>().ok()?;
+
+   if end < start {
+      return None;
+   }
+
+   Some(ContentRange {
+      start: Some(start),
+      byte_len,
+   })
+}
+
+fn partial_content_skip_len(url: &str, position: u64, resp: &ureq::Response) -> Result<u64> {
+   let content_range = resp
+      .header("content-range")
+      .and_then(parse_content_range)
+      .ok_or_else(|| {
+         Error::Http(format!(
+            "Failed to fetch {url}: server returned 206 for bytes={position}- without a valid Content-Range header",
+         ))
+      })?;
+
+   let start = content_range.start.ok_or_else(|| {
+      Error::Http(format!(
+         "Failed to fetch {url}: server returned 206 for bytes={position}- without a valid byte range",
+      ))
+   })?;
+
+   if start > position {
+      return Err(Error::Http(format!(
+         "Failed to fetch {url}: server returned 206 for bytes={position}- starting at byte {start}",
+      )));
+   }
+
+   Ok(position - start)
 }
 
 fn open_http_stream(src: &str, position: u64) -> Result<(String, HttpResponseReader, Option<u64>)> {
@@ -189,10 +244,19 @@ fn open_http_stream(src: &str, position: u64) -> Result<(String, HttpResponseRea
    .map_err(|error| map_request_error(src, error))?;
    let status = resp.status();
    let byte_len = parse_byte_len(&resp);
+   let skip_len = if position > 0 {
+      if status == 206 {
+         partial_content_skip_len(&url, position, &resp)?
+      } else {
+         position
+      }
+   } else {
+      0
+   };
    let mut reader = HttpResponseReader::new(resp);
 
-   if position > 0 && status != 206 {
-      skip_bytes(&mut reader, position).map_err(Error::Io)?;
+   if skip_len > 0 {
+      skip_bytes(&mut reader, skip_len).map_err(Error::Io)?;
    }
 
    Ok((url, reader, byte_len))
@@ -394,25 +458,16 @@ mod tests {
    }
 
    #[test]
-   fn fetch_remote_source_descriptor_falls_back_to_plain_request() {
-      let responses = vec![
-         ("HTTP/1.1 416 Range Not Satisfiable".to_string(), Vec::new()),
-         (
-            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg".to_string(),
-            b"abcde".to_vec(),
-         ),
-      ];
+   fn fetch_remote_source_descriptor_returns_http_status_error() {
+      let responses = vec![("HTTP/1.1 416 Range Not Satisfiable".to_string(), Vec::new())];
       let (url, request_rx, handle) = spawn_http_server(responses);
 
-      let descriptor = fetch_remote_source_descriptor(&url).unwrap();
-      let first_request = request_rx.recv().unwrap();
-      let second_request = request_rx.recv().unwrap();
+      let error = fetch_remote_source_descriptor(&url).unwrap_err();
+      let request = request_rx.recv().unwrap();
       handle.join().unwrap();
 
-      assert!(first_request.contains("Range: bytes=0-0"));
-      assert!(!second_request.contains("Range:"));
-      assert_eq!(descriptor.byte_len, Some(5));
-      assert_eq!(descriptor.mime_type.as_deref(), Some("audio/mpeg"));
+      assert!(request.contains("Range: bytes=0-0"));
+      assert!(error.to_string().contains("416"));
    }
 
    #[test]
@@ -429,6 +484,62 @@ mod tests {
       assert!(request.contains("Range: bytes=2-"));
       assert_eq!(byte_len, Some(6));
       assert_eq!(bytes, b"cdef");
+   }
+
+   #[test]
+   fn open_http_stream_accepts_matching_partial_content_range() {
+      let responses = vec![(
+         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-5/6".to_string(),
+         b"cdef".to_vec(),
+      )];
+      let (url, request_rx, handle) = spawn_http_server(responses);
+
+      let (_, mut reader, byte_len) = open_http_stream(&url, 2).unwrap();
+      let mut bytes = Vec::new();
+      reader.read_to_end(&mut bytes).unwrap();
+      let request = request_rx.recv().unwrap();
+      handle.join().unwrap();
+
+      assert!(request.contains("Range: bytes=2-"));
+      assert_eq!(byte_len, Some(6));
+      assert_eq!(bytes, b"cdef");
+   }
+
+   #[test]
+   fn open_http_stream_skips_extra_bytes_when_partial_content_range_starts_early() {
+      let responses = vec![(
+         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-5/6".to_string(),
+         b"bcdef".to_vec(),
+      )];
+      let (url, request_rx, handle) = spawn_http_server(responses);
+
+      let (_, mut reader, byte_len) = open_http_stream(&url, 2).unwrap();
+      let mut bytes = Vec::new();
+      reader.read_to_end(&mut bytes).unwrap();
+      let request = request_rx.recv().unwrap();
+      handle.join().unwrap();
+
+      assert!(request.contains("Range: bytes=2-"));
+      assert_eq!(byte_len, Some(6));
+      assert_eq!(bytes, b"cdef");
+   }
+
+   #[test]
+   fn open_http_stream_errors_when_partial_content_range_starts_after_request() {
+      let responses = vec![(
+         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6".to_string(),
+         b"def".to_vec(),
+      )];
+      let (url, request_rx, handle) = spawn_http_server(responses);
+
+      let error = open_http_stream(&url, 2).err().unwrap();
+      let request = request_rx.recv().unwrap();
+      handle.join().unwrap();
+
+      assert!(request.contains("Range: bytes=2-"));
+      assert!(error
+         .to_string()
+         .contains("server returned 206 for bytes=2- starting at byte 3"));
    }
 
    #[test]
