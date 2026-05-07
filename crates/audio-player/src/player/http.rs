@@ -1,12 +1,16 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Duration;
 
+use url::Url;
+
 use super::source::infer_hint;
 
 use crate::error::{Error, Result};
+use crate::net::reject_private_host;
 
 /// HTTP request timeout (connect + read combined).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_MAX_REDIRECTS: usize = 10;
 
 #[derive(Clone)]
 pub(crate) struct RemoteSourceDescriptor {
@@ -28,38 +32,115 @@ struct HttpResponseReader {
    inner: Box<dyn Read + Send + Sync>,
 }
 
+enum RequestError {
+   Ureq(Box<ureq::Error>),
+   Http(Error),
+}
+
 pub(crate) fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDescriptor> {
-   let resp = match descriptor_probe_request(src, true) {
-      Ok(resp) => resp,
-      Err(error) if matches!(error.as_ref(), ureq::Error::Status(_, _)) => {
-         descriptor_probe_request(src, false)
-            .map_err(|e| Error::Http(format!("Failed to fetch {src}: {e}")))?
+   let (url, resp) = match descriptor_probe_request(src, true) {
+      Ok(result) => result,
+      Err(RequestError::Ureq(error))
+         if matches!(error.as_ref(), ureq::Error::Status(_, _)) =>
+      {
+         descriptor_probe_request(src, false).map_err(|error| map_request_error(src, error))?
       }
-      Err(error) => return Err(Error::Http(format!("Failed to fetch {src}: {error}"))),
+      Err(error) => return Err(map_request_error(src, error)),
    };
 
    Ok(RemoteSourceDescriptor {
-      url: src.to_string(),
+      url: url.clone(),
       byte_len: parse_byte_len(&resp),
       mime_type: resp.header("content-type").map(str::to_string),
-      hint: infer_hint(src),
+      hint: infer_hint(&url),
    })
 }
 
 fn descriptor_probe_request(
    src: &str,
    use_range: bool,
-) -> std::result::Result<ureq::Response, Box<ureq::Error>> {
-   let request = descriptor_http_agent()
-      .get(src)
-      .set("Accept-Encoding", "identity");
-   let request = if use_range {
-      request.set("Range", "bytes=0-0")
-   } else {
-      request
-   };
+) -> std::result::Result<(String, ureq::Response), RequestError> {
+   send_request_following_redirects(src, |url| {
+      let request = descriptor_http_agent()
+         .get(url)
+         .set("Accept-Encoding", "identity");
+      let request = if use_range {
+         request.set("Range", "bytes=0-0")
+      } else {
+         request
+      };
 
-   request.call().map_err(Box::new)
+      request.call().map_err(Box::new)
+   })
+}
+
+fn map_request_error(src: &str, error: RequestError) -> Error {
+   match error {
+      RequestError::Ureq(error) => Error::Http(format!("Failed to fetch {src}: {error}")),
+      RequestError::Http(error) => error,
+   }
+}
+
+fn send_request_following_redirects<F>(
+   src: &str,
+   mut send_request: F,
+) -> std::result::Result<(String, ureq::Response), RequestError>
+where
+   F: FnMut(&str) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
+   let mut current_url = src.to_string();
+   let mut redirect_count = 0;
+
+   loop {
+      match send_request(&current_url) {
+         Ok(response) => return Ok((current_url, response)),
+         Err(error) => match *error {
+            ureq::Error::Status(status, response) if is_redirect_status(status) => {
+               if redirect_count >= HTTP_MAX_REDIRECTS {
+                  return Ok((current_url, response));
+               }
+
+               current_url =
+                  resolve_redirect_url(&current_url, &response).map_err(RequestError::Http)?;
+               redirect_count += 1;
+            }
+            error => return Err(RequestError::Ureq(Box::new(error))),
+         },
+      }
+   }
+}
+
+fn is_redirect_status(status: u16) -> bool {
+   matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn resolve_redirect_url(current_url: &str, response: &ureq::Response) -> Result<String> {
+   let location = response.header("location").ok_or_else(|| {
+      Error::Http(format!(
+         "Failed to fetch {current_url}: redirect response missing Location header",
+      ))
+   })?;
+
+   resolve_redirect_location(current_url, location)
+}
+
+fn resolve_redirect_location(current_url: &str, location: &str) -> Result<String> {
+   let base_url = Url::parse(current_url)
+      .map_err(|error| Error::Http(format!("Failed to fetch {current_url}: {error}")))?;
+   let redirect_url = base_url.join(location).map_err(|error| {
+      Error::Http(format!(
+         "Failed to fetch {current_url}: invalid redirect URL {location}: {error}",
+      ))
+   })?;
+   let redirect_url = redirect_url.to_string();
+
+   match reject_private_host(&redirect_url) {
+      Ok(()) => Ok(redirect_url),
+      Err(Error::Http(message)) => {
+         Err(Error::Http(format!("Failed to fetch {current_url}: {message}")))
+      }
+      Err(error) => Err(Error::Http(format!("Failed to fetch {current_url}: {error}"))),
+   }
 }
 
 fn descriptor_http_agent() -> ureq::Agent {
@@ -92,19 +173,20 @@ fn parse_content_range_len(value: &str) -> Option<u64> {
    value.rsplit('/').next()?.parse::<u64>().ok()
 }
 
-fn open_http_stream(url: &str, position: u64) -> Result<(HttpResponseReader, Option<u64>)> {
-   let request = stream_http_agent()
-      .get(url)
-      .set("Accept-Encoding", "identity");
-   let request = if position > 0 {
-      request.set("Range", &format!("bytes={position}-"))
-   } else {
-      request
-   };
+fn open_http_stream(src: &str, position: u64) -> Result<(String, HttpResponseReader, Option<u64>)> {
+   let (url, resp) = send_request_following_redirects(src, |next_url| {
+      let request = stream_http_agent()
+         .get(next_url)
+         .set("Accept-Encoding", "identity");
+      let request = if position > 0 {
+         request.set("Range", &format!("bytes={position}-"))
+      } else {
+         request
+      };
 
-   let resp = request
-      .call()
-      .map_err(|e| Error::Http(format!("Failed to fetch {url}: {e}")))?;
+      request.call().map_err(Box::new)
+   })
+   .map_err(|error| map_request_error(src, error))?;
    let status = resp.status();
    let byte_len = parse_byte_len(&resp);
    let mut reader = HttpResponseReader::new(resp);
@@ -113,7 +195,7 @@ fn open_http_stream(url: &str, position: u64) -> Result<(HttpResponseReader, Opt
       skip_bytes(&mut reader, position).map_err(Error::Io)?;
    }
 
-   Ok((reader, byte_len))
+   Ok((url, reader, byte_len))
 }
 
 fn skip_bytes<R: Read>(reader: &mut R, mut remaining: u64) -> std::io::Result<()> {
@@ -161,8 +243,10 @@ impl HttpAudioReader {
 
    fn ensure_reader(&mut self) -> std::io::Result<()> {
       if self.reader.is_none() && !self.reached_eof {
-         let (reader, byte_len) = open_http_stream(&self.url, self.position)
+         let (url, reader, byte_len) = open_http_stream(&self.url, self.position)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+         self.url = url;
 
          if self.byte_len.is_none() {
             self.byte_len = byte_len;
@@ -281,6 +365,35 @@ mod tests {
    }
 
    #[test]
+   fn resolve_redirect_location_supports_relative_urls() {
+      let redirect_url = resolve_redirect_location(
+         "https://cdn.example.com/audio/path/playlist.m3u8",
+         "../media/file.mp3?token=abc",
+      )
+      .unwrap();
+
+      assert_eq!(
+         redirect_url,
+         "https://cdn.example.com/audio/media/file.mp3?token=abc",
+      );
+   }
+
+   #[test]
+   fn resolve_redirect_location_rejects_private_hosts() {
+      let error = resolve_redirect_location(
+         "https://example.com/audio.mp3",
+         "http://127.0.0.1/private.mp3",
+      )
+      .unwrap_err();
+
+      assert!(
+         error
+            .to_string()
+            .contains("Requests to private/reserved address 127.0.0.1 are not allowed"),
+      );
+   }
+
+   #[test]
    fn fetch_remote_source_descriptor_falls_back_to_plain_request() {
       let responses = vec![
          ("HTTP/1.1 416 Range Not Satisfiable".to_string(), Vec::new()),
@@ -307,7 +420,7 @@ mod tests {
       let responses = vec![("HTTP/1.1 200 OK".to_string(), b"abcdef".to_vec())];
       let (url, request_rx, handle) = spawn_http_server(responses);
 
-      let (mut reader, byte_len) = open_http_stream(&url, 2).unwrap();
+      let (_, mut reader, byte_len) = open_http_stream(&url, 2).unwrap();
       let mut bytes = Vec::new();
       reader.read_to_end(&mut bytes).unwrap();
       let request = request_rx.recv().unwrap();
@@ -316,5 +429,35 @@ mod tests {
       assert!(request.contains("Range: bytes=2-"));
       assert_eq!(byte_len, Some(6));
       assert_eq!(bytes, b"cdef");
+   }
+
+   #[test]
+   fn send_request_following_redirects_returns_last_redirect_response_at_limit() {
+      let start_url = "https://example.com/redirect-0/audio.mp3";
+      let mut request_count = 0;
+
+      let (url, response) = send_request_following_redirects(start_url, |next_url| {
+         request_count += 1;
+
+         let hop = next_url
+            .split("/redirect-")
+            .nth(1)
+            .and_then(|suffix| suffix.split('/').next())
+            .and_then(|hop| hop.parse::<usize>().ok())
+            .unwrap();
+         let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: /redirect-{}/audio.mp3\r\n\r\n",
+            hop + 1,
+         )
+         .parse::<ureq::Response>()
+         .unwrap();
+
+         Err(Box::new(ureq::Error::Status(302, response)))
+      })
+      .unwrap();
+
+      assert_eq!(response.status(), 302);
+      assert_eq!(url, "https://example.com/redirect-10/audio.mp3");
+      assert_eq!(request_count, HTTP_MAX_REDIRECTS + 1);
    }
 }
