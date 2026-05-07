@@ -39,7 +39,15 @@ enum RequestError {
 }
 
 pub(crate) fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDescriptor> {
-   let (url, resp) = descriptor_probe_request(src, true).map_err(|error| map_request_error(src, error))?;
+   let (url, resp) = match descriptor_probe_request(src, true) {
+      Ok(result) => result,
+      Err(RequestError::Ureq(error)) => match *error {
+         ureq::Error::Status(416, _) => descriptor_probe_request(src, false)
+            .map_err(|error| map_request_error(src, error))?,
+         error => return Err(map_request_error(src, RequestError::Ureq(Box::new(error)))),
+      },
+      Err(error) => return Err(map_request_error(src, error)),
+   };
 
    Ok(RemoteSourceDescriptor {
       url: url.clone(),
@@ -458,16 +466,26 @@ mod tests {
    }
 
    #[test]
-   fn fetch_remote_source_descriptor_returns_http_status_error() {
-      let responses = vec![("HTTP/1.1 416 Range Not Satisfiable".to_string(), Vec::new())];
+   fn fetch_remote_source_descriptor_falls_back_to_plain_get_on_416() {
+      let responses = vec![
+         ("HTTP/1.1 416 Range Not Satisfiable".to_string(), Vec::new()),
+         (
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg".to_string(),
+            b"abcdef".to_vec(),
+         ),
+      ];
       let (url, request_rx, handle) = spawn_http_server(responses);
 
-      let error = fetch_remote_source_descriptor(&url).unwrap_err();
-      let request = request_rx.recv().unwrap();
+      let descriptor = fetch_remote_source_descriptor(&url).unwrap();
+      let first_request = request_rx.recv().unwrap();
+      let second_request = request_rx.recv().unwrap();
       handle.join().unwrap();
 
-      assert!(request.contains("Range: bytes=0-0"));
-      assert!(error.to_string().contains("416"));
+      assert!(first_request.contains("Range: bytes=0-0"));
+      assert!(!second_request.contains("\r\nRange:"));
+      assert_eq!(descriptor.url, url);
+      assert_eq!(descriptor.byte_len, Some(6));
+      assert_eq!(descriptor.mime_type.as_deref(), Some("audio/mpeg"));
    }
 
    #[test]
