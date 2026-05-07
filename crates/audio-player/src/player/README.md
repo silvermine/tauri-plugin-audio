@@ -146,8 +146,11 @@ When playback is reopened at a non-zero point, the new sink starts counting from
 The monitor thread reports user-facing time like this:
 
 ```text
-current_time = position_offset + (sink_elapsed * playback_rate)
+current_time = position_offset + (max(sink_elapsed - position_latency, 0.0) * playback_rate)
 ```
+
+For normal `1.0x` playback, `position_latency` is `0.0`.
+For stretched playback, it removes the time-stretcher's output pre-roll so `current_time` tracks audible media time instead of buffered sink time.
 
 So after reopening at `37.5s`, the sink can still start from zero internally while the public clock continues from `37.5s`.
 
@@ -283,7 +286,8 @@ The monitor thread polls every `250 ms` and publishes time updates.
 After a reopen-based seek, it is restarted so that updates come from the new sink.
 
 ```text
-monitor time = position_offset + (sink.get_pos() * playback_rate)
+audible_sink_time = max(sink.get_pos() - position_latency, 0.0)
+monitor time = position_offset + (audible_sink_time * playback_rate)
 ```
 
 This is what keeps user-visible time correct across:

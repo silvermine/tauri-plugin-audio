@@ -43,6 +43,7 @@ struct PlaybackContext {
    source: SourceDescriptor,
    duration: f64,
    position_offset: f64,
+   position_latency: f64,
    seek_strategy: SeekStrategy,
    resume_fade: Option<ResumeFadeHandle>,
 }
@@ -191,6 +192,7 @@ impl RodioAudioPlayer {
             source: descriptor.clone(),
             duration,
             position_offset: 0.0,
+            position_latency: opened_source.position_latency,
             seek_strategy: opened_source.seek_strategy,
             resume_fade: opened_source.resume_fade,
          });
@@ -215,6 +217,7 @@ impl RodioAudioPlayer {
             ctx.sink.append(opened_source.source);
             ctx.sink.pause();
             ctx.position_offset = 0.0;
+            ctx.position_latency = opened_source.position_latency;
             ctx.seek_strategy = opened_source.seek_strategy;
             ctx.resume_fade = opened_source.resume_fade;
             replayed_from_start = true;
@@ -393,6 +396,7 @@ impl RodioAudioPlayer {
       let sink = Player::connect_new(self.output_sink.mixer());
       sink.pause();
       let duration = opened_source.duration;
+      let position_latency = opened_source.position_latency;
       let seek_strategy = opened_source.seek_strategy;
       let resume_fade = opened_source.resume_fade;
       sink.append(opened_source.source);
@@ -411,6 +415,7 @@ impl RodioAudioPlayer {
          source: source_descriptor,
          duration,
          position_offset: target_time,
+         position_latency,
          seek_strategy,
          resume_fade,
       }) {
@@ -449,6 +454,7 @@ impl RodioAudioPlayer {
          };
          ctx.sink.append(opened_source.source);
          ctx.sink.pause();
+         ctx.position_latency = opened_source.position_latency;
          ctx.seek_strategy = opened_source.seek_strategy;
          ctx.resume_fade = opened_source.resume_fade;
          reopened_source = true;
@@ -629,8 +635,9 @@ fn monitor_loop(
 
       let (pos, duration, is_empty) = match &guard.playback {
          Some(ctx) => {
-            let pos =
-               ctx.position_offset + (ctx.sink.get_pos().as_secs_f64() * guard.state.playback_rate);
+            let sink_pos = ctx.sink.get_pos().as_secs_f64();
+            let audible_sink_pos = (sink_pos - ctx.position_latency).max(0.0);
+            let pos = ctx.position_offset + (audible_sink_pos * guard.state.playback_rate);
             (pos, ctx.duration, ctx.sink.empty())
          }
          None => break,
@@ -643,10 +650,12 @@ fn monitor_loop(
             if let Some(ctx) = &mut guard.playback {
                match open_source_at(&ctx.source, 0.0, playback_rate) {
                   Ok(source) => {
+                     let position_latency = source.position_latency;
                      let seek_strategy = source.seek_strategy;
                      let resume_fade = source.resume_fade;
                      ctx.sink.append(source.source);
                      ctx.position_offset = 0.0;
+                     ctx.position_latency = position_latency;
                      ctx.seek_strategy = seek_strategy;
                      ctx.resume_fade = resume_fade;
 

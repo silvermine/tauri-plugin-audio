@@ -29,6 +29,7 @@ pub(crate) type BoxedSource = Box<dyn Source<Item = Sample> + Send>;
 pub(crate) struct OpenedSource {
    pub(crate) source: BoxedSource,
    pub(crate) duration: f64,
+   pub(crate) position_latency: f64,
    pub(crate) seek_strategy: SeekStrategy,
    pub(crate) resume_fade: Option<ResumeFadeHandle>,
 }
@@ -67,18 +68,20 @@ pub(crate) fn open_source_at(
       .total_duration()
       .map(|value| value.as_secs_f64())
       .unwrap_or(0.0);
-   let (source, resume_fade) = if (playback_rate - 1.0).abs() > f64::EPSILON {
-      let (source, resume_fade) =
-         ResumeFadeSource::new(StretchSource::new(decoded_source, playback_rate)?);
+   let (source, resume_fade, position_latency) = if (playback_rate - 1.0).abs() > f64::EPSILON {
+      let stretch_source = StretchSource::new(decoded_source, playback_rate)?;
+      let position_latency = stretch_source.output_latency_seconds();
+      let (source, resume_fade) = ResumeFadeSource::new(stretch_source);
 
-      (Box::new(source) as BoxedSource, Some(resume_fade))
+      (Box::new(source) as BoxedSource, Some(resume_fade), position_latency)
    } else {
-      (decoded_source, None)
+      (decoded_source, None, 0.0)
    };
 
    Ok(OpenedSource {
       source,
       duration,
+      position_latency,
       seek_strategy,
       resume_fade,
    })

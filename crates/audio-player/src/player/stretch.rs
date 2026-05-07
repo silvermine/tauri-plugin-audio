@@ -57,6 +57,10 @@ impl StretchSource {
       })
    }
 
+   pub(crate) fn output_latency_seconds(&self) -> f64 {
+      self.stream.output_latency() as f64 / self.sample_rate.get() as f64
+   }
+
    fn channel_count(&self) -> usize {
       self.channels.get() as usize
    }
