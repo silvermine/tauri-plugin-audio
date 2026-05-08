@@ -73,7 +73,11 @@ pub(crate) fn open_source_at(
       let position_latency = stretch_source.output_latency_seconds();
       let (source, resume_fade) = ResumeFadeSource::new(stretch_source);
 
-      (Box::new(source) as BoxedSource, Some(resume_fade), position_latency)
+      (
+         Box::new(source) as BoxedSource,
+         Some(resume_fade),
+         position_latency,
+      )
    } else {
       (decoded_source, None, 0.0)
    };

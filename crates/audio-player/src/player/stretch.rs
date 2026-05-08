@@ -279,17 +279,29 @@ mod tests {
 
       let output_frames = source.output_buffer.len() / source.channel_count();
       let consumed_input_frames = source.input_buffer.len() / source.channel_count();
-      let pending_samples = source.pending_input_buffer.iter().copied().collect::<Vec<_>>();
+      let pending_samples = source
+         .pending_input_buffer
+         .iter()
+         .copied()
+         .collect::<Vec<_>>();
 
       assert!(output_frames < OUTPUT_BLOCK_FRAMES);
       assert!(consumed_input_frames < available_input_frames);
-      assert_eq!(source.input_buffer, samples[..consumed_input_frames].to_vec());
+      assert_eq!(
+         source.input_buffer,
+         samples[..consumed_input_frames].to_vec()
+      );
       assert_eq!(pending_samples, samples[consumed_input_frames..].to_vec());
    }
 
    #[test]
    fn draining_source_marks_it_ended() {
-      let mut source = build_source(vec![0.25, -0.25, 0.5, -0.5], channel_count(), sample_rate(), 1.1);
+      let mut source = build_source(
+         vec![0.25, -0.25, 0.5, -0.5],
+         channel_count(),
+         sample_rate(),
+         1.1,
+      );
       let mut produced_samples = 0;
 
       while source.next().is_some() {

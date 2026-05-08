@@ -42,8 +42,9 @@ pub(crate) fn fetch_remote_source_descriptor(src: &str) -> Result<RemoteSourceDe
    let (url, resp) = match descriptor_probe_request(src, true) {
       Ok(result) => result,
       Err(RequestError::Ureq(error)) => match *error {
-         ureq::Error::Status(416, _) => descriptor_probe_request(src, false)
-            .map_err(|error| map_request_error(src, error))?,
+         ureq::Error::Status(416, _) => {
+            descriptor_probe_request(src, false).map_err(|error| map_request_error(src, error))?
+         }
          error => return Err(map_request_error(src, RequestError::Ureq(Box::new(error)))),
       },
       Err(error) => return Err(map_request_error(src, error)),
@@ -98,7 +99,9 @@ where
          Err(error) => match *error {
             ureq::Error::Status(status, response) if is_redirect_status(status) => {
                if redirect_count >= HTTP_MAX_REDIRECTS {
-                  return Ok((current_url, response));
+                  return Err(RequestError::Http(Error::Http(format!(
+                     "Failed to fetch {src}: exceeded redirect limit of {HTTP_MAX_REDIRECTS}",
+                  ))));
                }
 
                current_url =
@@ -137,10 +140,12 @@ fn resolve_redirect_location(current_url: &str, location: &str) -> Result<String
 
    match reject_private_host(&redirect_url) {
       Ok(()) => Ok(redirect_url),
-      Err(Error::Http(message)) => {
-         Err(Error::Http(format!("Failed to fetch {current_url}: {message}")))
-      }
-      Err(error) => Err(Error::Http(format!("Failed to fetch {current_url}: {error}"))),
+      Err(Error::Http(message)) => Err(Error::Http(format!(
+         "Failed to fetch {current_url}: {message}"
+      ))),
+      Err(error) => Err(Error::Http(format!(
+         "Failed to fetch {current_url}: {error}"
+      ))),
    }
 }
 
@@ -555,17 +560,19 @@ mod tests {
       handle.join().unwrap();
 
       assert!(request.contains("Range: bytes=2-"));
-      assert!(error
-         .to_string()
-         .contains("server returned 206 for bytes=2- starting at byte 3"));
+      assert!(
+         error
+            .to_string()
+            .contains("server returned 206 for bytes=2- starting at byte 3")
+      );
    }
 
    #[test]
-   fn send_request_following_redirects_returns_last_redirect_response_at_limit() {
+   fn send_request_following_redirects_errors_at_limit() {
       let start_url = "https://example.com/redirect-0/audio.mp3";
       let mut request_count = 0;
 
-      let (url, response) = send_request_following_redirects(start_url, |next_url| {
+      let error = send_request_following_redirects(start_url, |next_url| {
          request_count += 1;
 
          let hop = next_url
@@ -583,10 +590,14 @@ mod tests {
 
          Err(Box::new(ureq::Error::Status(302, response)))
       })
+      .err()
       .unwrap();
 
-      assert_eq!(response.status(), 302);
-      assert_eq!(url, "https://example.com/redirect-10/audio.mp3");
+      assert!(
+         matches!(error, RequestError::Http(Error::Http(message)) if message == format!(
+            "Failed to fetch {start_url}: exceeded redirect limit of {HTTP_MAX_REDIRECTS}",
+         ))
+      );
       assert_eq!(request_count, HTTP_MAX_REDIRECTS + 1);
    }
 }
