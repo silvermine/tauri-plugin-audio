@@ -333,7 +333,12 @@ impl RodioAudioPlayer {
             .as_ref()
             .map(|ctx| (ctx.source.clone(), ctx.seek_strategy))
          {
-            if matches!(seek_strategy, SeekStrategy::Direct) {
+            // Check the current state playback rate as well as the stored seek strategy.
+            // During a playback-rate reopen, inner.playback can still point at the old
+            // 1.0x PlaybackContext while inner.state.playback_rate has already been updated
+            // to the requested non-1.0x value. In that window, forcing reopen avoids
+            // seeking the stale sink locally and leaving state ahead of actual playback.
+            if seek_can_use_direct_strategy(seek_strategy, inner.state.playback_rate) {
                if inner.playback.as_ref().is_some_and(|ctx| {
                   playback_requires_restart_from_start(status, ctx.sink.empty())
                }) {
@@ -858,6 +863,11 @@ fn restore_reopen_failure_state(
 
 fn playback_rate_change_requires_reopen(previous_playback_rate: f64, playback_rate: f64) -> bool {
    (playback_rate - previous_playback_rate).abs() > f64::EPSILON
+}
+
+fn seek_can_use_direct_strategy(seek_strategy: SeekStrategy, playback_rate: f64) -> bool {
+   matches!(seek_strategy, SeekStrategy::Direct)
+      && (playback_rate - 1.0).abs() <= f64::EPSILON
 }
 
 #[cfg(test)]
