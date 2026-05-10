@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.89"
 description = "Partial Rust port of signalsmith-stretch audio time stretching library"
+publish = false
 
 [dependencies]
 thiserror = "2.0.17"
