@@ -176,7 +176,9 @@ impl RodioAudioPlayer {
             sink.stop();
             retry_count += 1;
             if retry_count >= MAX_RETRIES {
-               return Err(Error::InvalidState("Playback rate changed too many times during load".into()));
+               return Err(Error::InvalidState(
+                  "Playback rate changed too many times during load".into(),
+               ));
             }
             continue;
          }
@@ -202,43 +204,65 @@ impl RodioAudioPlayer {
    }
 
    pub fn play(&self) -> Result<AudioActionResponse> {
-      let snapshot = {
+      enum PlayAction {
+         Complete(PlayerState),
+         Reopen {
+            source_descriptor: SourceDescriptor,
+            playback_rate: f64,
+            load_generation: u64,
+            seek_generation: u64,
+            expected_status: PlaybackStatus,
+         },
+      }
+
+      let action = {
          let mut inner = lock_inner(&self.inner);
          let was_paused = inner.state.status == PlaybackStatus::Paused;
-         let is_ended = inner.state.status == PlaybackStatus::Ended;
-         let mut replayed_from_start = false;
-         let playback_rate = inner.state.playback_rate;
-
-         if is_ended
-            && let Some(ctx) = &mut inner.playback
-            && ctx.sink.empty()
+         let status = inner.state.status;
+         if let Some(source_descriptor) = inner
+               .playback
+               .as_ref()
+               .filter(|ctx| playback_requires_restart_from_start(status, ctx.sink.empty()))
+               .map(|ctx| ctx.source.clone())
          {
-            let opened_source = open_source_at(&ctx.source, 0.0, playback_rate)?;
-            ctx.sink.append(opened_source.source);
-            ctx.sink.pause();
-            ctx.position_offset = 0.0;
-            ctx.position_latency = opened_source.position_latency;
-            ctx.seek_strategy = opened_source.seek_strategy;
-            ctx.resume_fade = opened_source.resume_fade;
-            replayed_from_start = true;
-         }
+            PlayAction::Reopen {
+               source_descriptor,
+               playback_rate: inner.state.playback_rate,
+               load_generation: inner.load_generation,
+               seek_generation: inner.seek_generation,
+               expected_status: status,
+            }
+         } else {
+            transitions::play(&mut inner.state)?;
 
-         transitions::play(&mut inner.state)?;
+            if let Some(ctx) = &inner.playback {
+               if was_paused && let Some(resume_fade) = &ctx.resume_fade {
+                  resume_fade.request_fade_in();
+               }
 
-         if replayed_from_start {
-            inner.state.current_time = 0.0;
-         }
-
-         if let Some(ctx) = &inner.playback {
-            if was_paused && let Some(resume_fade) = &ctx.resume_fade {
-               resume_fade.request_fade_in();
+               ctx.sink.play();
             }
 
-            ctx.sink.play();
+            self.start_monitor(&mut inner);
+            PlayAction::Complete(inner.state.clone())
          }
+      };
 
-         self.start_monitor(&mut inner);
-         inner.state.clone()
+      let snapshot = match action {
+         PlayAction::Complete(snapshot) => snapshot,
+         PlayAction::Reopen {
+            source_descriptor,
+            playback_rate,
+            load_generation,
+            seek_generation,
+            expected_status,
+         } => self.reopen_ended_playback_from_start(
+            source_descriptor,
+            playback_rate,
+            load_generation,
+            seek_generation,
+            expected_status,
+         )?,
       };
 
       (self.on_changed)(&snapshot);
@@ -297,8 +321,8 @@ impl RodioAudioPlayer {
 
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
-         let was_ended = inner.state.status == PlaybackStatus::Ended;
          let previous_time = inner.state.current_time;
+         let status = inner.state.status;
 
          transitions::seek(&mut inner.state, position)?;
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
@@ -310,8 +334,19 @@ impl RodioAudioPlayer {
             .map(|ctx| (ctx.source.clone(), ctx.seek_strategy))
          {
             if matches!(seek_strategy, SeekStrategy::Direct) {
-               Self::seek_local_playback(&mut inner, &source_descriptor, was_ended, previous_time)?;
-               SeekAction::Complete(inner.state.clone())
+               if inner.playback.as_ref().is_some_and(|ctx| {
+                  playback_requires_restart_from_start(status, ctx.sink.empty())
+               }) {
+                  SeekAction::Reopen {
+                     source_descriptor,
+                     target_time: inner.state.current_time,
+                     previous_time,
+                     seek_generation,
+                  }
+               } else {
+                  Self::seek_local_playback(&mut inner, previous_time)?;
+                  SeekAction::Complete(inner.state.clone())
+               }
             } else {
                Self::stop_monitor(&inner);
                if let Some(ctx) = &inner.playback {
@@ -432,41 +467,76 @@ impl RodioAudioPlayer {
       Ok(inner.state.clone())
    }
 
-   fn seek_local_playback(
-      inner: &mut Inner,
-      source_descriptor: &SourceDescriptor,
-      was_ended: bool,
-      previous_time: f64,
-   ) -> Result<()> {
-      let playback_rate = inner.state.playback_rate;
+   /// Reopens an ended track from the beginning for play(), without holding the
+   /// player mutex during I/O. Unlike reopen_playback_at(), this always resumes
+   /// from 0.0 and re-applies the play transition instead of preserving a seek target.
+   fn reopen_ended_playback_from_start(
+      &self,
+      source_descriptor: SourceDescriptor,
+      playback_rate: f64,
+      load_generation: u64,
+      seek_generation: u64,
+      expected_status: PlaybackStatus,
+   ) -> Result<PlayerState> {
+      let opened_source = open_source_at(&source_descriptor, 0.0, playback_rate)?;
+      let mut inner = lock_inner(&self.inner);
+
+      if inner.load_generation != load_generation || inner.seek_generation != seek_generation {
+         return Err(Error::InvalidState("Play request was canceled".into()));
+      }
+
+      if inner.state.status != expected_status {
+         return Err(Error::InvalidState("Play request was canceled".into()));
+      }
+
+      let position_latency = opened_source.position_latency;
+      let seek_strategy = opened_source.seek_strategy;
+      let resume_fade = opened_source.resume_fade;
+
+      {
+         let Some(ctx) = &mut inner.playback else {
+            return Err(Error::InvalidState("Play request was canceled".into()));
+         };
+
+         if !ctx.sink.empty() {
+            return Err(Error::InvalidState("Play request was canceled".into()));
+         }
+
+         ctx.sink.append(opened_source.source);
+         ctx.sink.pause();
+         ctx.position_offset = 0.0;
+         ctx.position_latency = position_latency;
+         ctx.seek_strategy = seek_strategy;
+         ctx.resume_fade = resume_fade;
+      }
+
+      transitions::play(&mut inner.state)?;
+      inner.state.current_time = 0.0;
+
+      if let Some(ctx) = &inner.playback {
+         if expected_status == PlaybackStatus::Paused
+            && let Some(resume_fade) = &ctx.resume_fade
+         {
+            resume_fade.request_fade_in();
+         }
+
+         ctx.sink.play();
+      }
+
+      self.start_monitor(&mut inner);
+
+      Ok(inner.state.clone())
+   }
+
+   fn seek_local_playback(inner: &mut Inner, previous_time: f64) -> Result<()> {
       let Some(ctx) = &mut inner.playback else {
          unreachable!("Playback context disappeared during local seek");
       };
-      let mut reopened_source = false;
-
-      if was_ended && ctx.sink.empty() {
-         let opened_source = match open_source_at(source_descriptor, 0.0, playback_rate) {
-            Ok(source) => source,
-            Err(error) => {
-               inner.state.current_time = previous_time;
-               return Err(error);
-            }
-         };
-         ctx.sink.append(opened_source.source);
-         ctx.sink.pause();
-         ctx.position_latency = opened_source.position_latency;
-         ctx.seek_strategy = opened_source.seek_strategy;
-         ctx.resume_fade = opened_source.resume_fade;
-         reopened_source = true;
-      }
 
       if let Err(e) = ctx
          .sink
          .try_seek(Duration::from_secs_f64(inner.state.current_time))
       {
-         if reopened_source {
-            ctx.sink.stop();
-         }
          inner.state.current_time = previous_time;
          return Err(Error::Audio(format!("Failed to seek audio: {e}")));
       }
@@ -647,32 +717,66 @@ fn monitor_loop(
          if guard.state.looping {
             // Re-append source for seamless (best-effort) loop.
             let playback_rate = guard.state.playback_rate;
-            if let Some(ctx) = &mut guard.playback {
-               match open_source_at(&ctx.source, 0.0, playback_rate) {
-                  Ok(source) => {
-                     let position_latency = source.position_latency;
-                     let seek_strategy = source.seek_strategy;
-                     let resume_fade = source.resume_fade;
+            let load_generation = guard.load_generation;
+            let seek_generation = guard.seek_generation;
+            let Some(source_descriptor) = guard.playback.as_ref().map(|ctx| ctx.source.clone())
+            else {
+               break;
+            };
+            drop(guard);
+
+            let reopened_source = open_source_at(&source_descriptor, 0.0, playback_rate);
+
+            let mut guard = lock_inner(&inner);
+
+            match classify_loop_reopen_attempt(&guard, &stop, load_generation, seek_generation) {
+               LoopReopenAttempt::Apply => {}
+               LoopReopenAttempt::Retry => continue,
+               LoopReopenAttempt::Break => break,
+            }
+
+            // Discard stale reopen work if this monitor was stopped or playback
+            // changed state while open_source_at() was running.
+            if stop.load(Ordering::Relaxed) || guard.state.status != PlaybackStatus::Playing {
+               break;
+            }
+
+            if !guard.state.looping {
+               let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
+               drop(guard);
+               on_changed(&snapshot);
+               break;
+            }
+
+            match reopened_source {
+               Ok(source) => {
+                  let position_latency = source.position_latency;
+                  let seek_strategy = source.seek_strategy;
+                  let resume_fade = source.resume_fade;
+
+                  if let Some(ctx) = &mut guard.playback {
                      ctx.sink.append(source.source);
                      ctx.position_offset = 0.0;
                      ctx.position_latency = position_latency;
                      ctx.seek_strategy = seek_strategy;
                      ctx.resume_fade = resume_fade;
-
-                     guard.state.current_time = 0.0;
-                     drop(guard);
-                     on_time_update(&TimeUpdate {
-                        current_time: 0.0,
-                        duration,
-                     });
-                  }
-                  Err(e) => {
-                     warn!("Failed to reopen loop source: {e}");
-                     let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
-                     drop(guard);
-                     on_changed(&snapshot);
+                  } else {
                      break;
                   }
+
+                  guard.state.current_time = 0.0;
+                  drop(guard);
+                  on_time_update(&TimeUpdate {
+                     current_time: 0.0,
+                     duration,
+                  });
+               }
+               Err(e) => {
+                  warn!("Failed to reopen loop source: {e}");
+                  let snapshot = finish_playback_as_ended(&mut guard, duration, pos);
+                  drop(guard);
+                  on_changed(&snapshot);
+                  break;
                }
             }
          } else {
@@ -696,6 +800,28 @@ fn monitor_loop(
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
+enum LoopReopenAttempt {
+   Apply,
+   Retry,
+   Break,
+}
+
+fn classify_loop_reopen_attempt(
+   inner: &Inner,
+   stop: &Arc<AtomicBool>,
+   load_generation: u64,
+   seek_generation: u64,
+) -> LoopReopenAttempt {
+   if inner.load_generation != load_generation || !Arc::ptr_eq(&inner.monitor_stop, stop) {
+      LoopReopenAttempt::Break
+   } else if inner.seek_generation != seek_generation {
+      LoopReopenAttempt::Retry
+   } else {
+      LoopReopenAttempt::Apply
+   }
+}
+
 /// Acquires the mutex, recovering from poisoning instead of panicking.
 ///
 /// A poisoned mutex means a thread panicked while holding the lock. The inner
@@ -712,6 +838,10 @@ fn effective_volume(state: &PlayerState) -> f32 {
    } else {
       state.volume as f32
    }
+}
+
+fn playback_requires_restart_from_start(status: PlaybackStatus, sink_empty: bool) -> bool {
+   sink_empty && matches!(status, PlaybackStatus::Ended | PlaybackStatus::Paused)
 }
 
 fn restore_reopen_failure_state(
