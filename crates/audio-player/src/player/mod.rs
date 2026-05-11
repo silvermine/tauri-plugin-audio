@@ -150,12 +150,11 @@ impl RodioAudioPlayer {
    ) -> Result<PlayerState> {
       let descriptor = load_source_descriptor(src)?;
 
-      let mut playback_rate = lock_inner(&self.inner).state.playback_rate;
-      let mut retry_count = 0;
-      const MAX_RETRIES: u32 = 3;
+      let mut attempted_playback_rate = lock_inner(&self.inner).state.playback_rate;
+      let mut playback_rate_retry_stage = LoadPlaybackRateRetryStage::NotRetried;
 
       loop {
-         let opened_source = open_source_at(&descriptor, 0.0, playback_rate)?;
+         let opened_source = open_source_at(&descriptor, 0.0, attempted_playback_rate)?;
          let duration = opened_source.duration;
 
          // Create a new sink, append the decoded source, and pause immediately
@@ -171,16 +170,29 @@ impl RodioAudioPlayer {
             return Err(Error::InvalidState("Load request was canceled".into()));
          }
 
-         if inner.state.playback_rate != playback_rate {
-            playback_rate = inner.state.playback_rate;
-            sink.stop();
-            retry_count += 1;
-            if retry_count >= MAX_RETRIES {
+         let playback_rate_change_action = classify_load_playback_rate_change(
+            inner.state.playback_rate,
+            attempted_playback_rate,
+            playback_rate_retry_stage,
+         );
+
+         match playback_rate_change_action {
+            LoadPlaybackRateChangeAction::Apply => {}
+            LoadPlaybackRateChangeAction::RetryDuringLoad {
+               next_playback_rate,
+               retry_stage,
+            } => {
+               attempted_playback_rate = next_playback_rate;
+               playback_rate_retry_stage = retry_stage;
+               sink.stop();
+               continue;
+            }
+            LoadPlaybackRateChangeAction::Exhausted => {
+               sink.stop();
                return Err(Error::InvalidState(
                   "Playback rate changed too many times during load".into(),
                ));
             }
-            continue;
          }
 
          transitions::load(&mut inner.state, src, meta, duration)?;
@@ -220,10 +232,10 @@ impl RodioAudioPlayer {
          let was_paused = inner.state.status == PlaybackStatus::Paused;
          let status = inner.state.status;
          if let Some(source_descriptor) = inner
-               .playback
-               .as_ref()
-               .filter(|ctx| playback_requires_restart_from_start(status, ctx.sink.empty()))
-               .map(|ctx| ctx.source.clone())
+            .playback
+            .as_ref()
+            .filter(|ctx| playback_requires_restart_from_start(status, ctx.sink.empty()))
+            .map(|ctx| ctx.source.clone())
          {
             PlayAction::Reopen {
                source_descriptor,
@@ -328,46 +340,47 @@ impl RodioAudioPlayer {
          inner.seek_generation = inner.seek_generation.wrapping_add(1);
          let seek_generation = inner.seek_generation;
 
-         let action = if let Some((source_descriptor, seek_strategy)) = inner
-            .playback
-            .as_ref()
-            .map(|ctx| (ctx.source.clone(), ctx.seek_strategy))
-         {
-            // Check the current state playback rate as well as the stored seek strategy.
-            // During a playback-rate reopen, inner.playback can still point at the old
-            // 1.0x PlaybackContext while inner.state.playback_rate has already been updated
-            // to the requested non-1.0x value. In that window, forcing reopen avoids
-            // seeking the stale sink locally and leaving state ahead of actual playback.
-            if seek_can_use_direct_strategy(seek_strategy, inner.state.playback_rate) {
-               if inner.playback.as_ref().is_some_and(|ctx| {
-                  playback_requires_restart_from_start(status, ctx.sink.empty())
-               }) {
+         let action =
+            if let Some((source_descriptor, seek_strategy)) = inner
+               .playback
+               .as_ref()
+               .map(|ctx| (ctx.source.clone(), ctx.seek_strategy))
+            {
+               // Check the current state playback rate as well as the stored seek strategy.
+               // During a playback-rate reopen, inner.playback can still point at the old
+               // 1.0x PlaybackContext while inner.state.playback_rate has already been updated
+               // to the requested non-1.0x value. In that window, forcing reopen avoids
+               // seeking the stale sink locally and leaving state ahead of actual playback.
+               if seek_can_use_direct_strategy(seek_strategy, inner.state.playback_rate) {
+                  if inner.playback.as_ref().is_some_and(|ctx| {
+                     playback_requires_restart_from_start(status, ctx.sink.empty())
+                  }) {
+                     SeekAction::Reopen {
+                        source_descriptor,
+                        target_time: inner.state.current_time,
+                        previous_time,
+                        seek_generation,
+                     }
+                  } else {
+                     Self::seek_local_playback(&mut inner, previous_time)?;
+                     SeekAction::Complete(inner.state.clone())
+                  }
+               } else {
+                  Self::stop_monitor(&inner);
+                  if let Some(ctx) = &inner.playback {
+                     ctx.sink.pause();
+                  }
+
                   SeekAction::Reopen {
                      source_descriptor,
                      target_time: inner.state.current_time,
                      previous_time,
                      seek_generation,
                   }
-               } else {
-                  Self::seek_local_playback(&mut inner, previous_time)?;
-                  SeekAction::Complete(inner.state.clone())
                }
             } else {
-               Self::stop_monitor(&inner);
-               if let Some(ctx) = &inner.playback {
-                  ctx.sink.pause();
-               }
-
-               SeekAction::Reopen {
-                  source_descriptor,
-                  target_time: inner.state.current_time,
-                  previous_time,
-                  seek_generation,
-               }
-            }
-         } else {
-            SeekAction::Complete(inner.state.clone())
-         };
+               SeekAction::Complete(inner.state.clone())
+            };
 
          match action {
             SeekAction::Complete(snapshot) => snapshot,
@@ -812,6 +825,23 @@ enum LoopReopenAttempt {
    Break,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadPlaybackRateRetryStage {
+   NotRetried,
+   RetriedOnce,
+   RetriedTwice,
+}
+
+#[derive(Debug, PartialEq)]
+enum LoadPlaybackRateChangeAction {
+   Apply,
+   RetryDuringLoad {
+      next_playback_rate: f64,
+      retry_stage: LoadPlaybackRateRetryStage,
+   },
+   Exhausted,
+}
+
 fn classify_loop_reopen_attempt(
    inner: &Inner,
    stop: &Arc<AtomicBool>,
@@ -824,6 +854,31 @@ fn classify_loop_reopen_attempt(
       LoopReopenAttempt::Retry
    } else {
       LoopReopenAttempt::Apply
+   }
+}
+
+fn classify_load_playback_rate_change(
+   current_requested_playback_rate: f64,
+   attempted_playback_rate: f64,
+   retry_stage: LoadPlaybackRateRetryStage,
+) -> LoadPlaybackRateChangeAction {
+   if !playback_rate_change_requires_reopen(
+      attempted_playback_rate,
+      current_requested_playback_rate,
+   ) {
+      LoadPlaybackRateChangeAction::Apply
+   } else {
+      match retry_stage {
+         LoadPlaybackRateRetryStage::NotRetried => LoadPlaybackRateChangeAction::RetryDuringLoad {
+            next_playback_rate: current_requested_playback_rate,
+            retry_stage: LoadPlaybackRateRetryStage::RetriedOnce,
+         },
+         LoadPlaybackRateRetryStage::RetriedOnce => LoadPlaybackRateChangeAction::RetryDuringLoad {
+            next_playback_rate: current_requested_playback_rate,
+            retry_stage: LoadPlaybackRateRetryStage::RetriedTwice,
+         },
+         LoadPlaybackRateRetryStage::RetriedTwice => LoadPlaybackRateChangeAction::Exhausted,
+      }
    }
 }
 
@@ -866,8 +921,7 @@ fn playback_rate_change_requires_reopen(previous_playback_rate: f64, playback_ra
 }
 
 fn seek_can_use_direct_strategy(seek_strategy: SeekStrategy, playback_rate: f64) -> bool {
-   matches!(seek_strategy, SeekStrategy::Direct)
-      && (playback_rate - 1.0).abs() <= f64::EPSILON
+   matches!(seek_strategy, SeekStrategy::Direct) && (playback_rate - 1.0).abs() <= f64::EPSILON
 }
 
 #[cfg(test)]
