@@ -501,7 +501,7 @@ fn validate_interleaved_output(
    channels: usize,
 ) -> Result<(), PlaybackStreamError> {
    validate_channels(channels)?;
-   if output_len % channels == 0 {
+   if output_len.is_multiple_of(channels) {
       Ok(())
    } else {
       Err(PlaybackStreamError::InvalidInterleavedOutputLength {
